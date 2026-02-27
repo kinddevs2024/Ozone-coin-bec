@@ -13,7 +13,20 @@ const DB_NAME = "Ozone-coin";
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
+// Разрешаем и http, и https для ozone-coin.online (чтобы работало до и после SSL)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
+const ALLOWED_ORIGINS = [
+  "http://ozone-coin.online",
+  "https://ozone-coin.online",
+  "http://www.ozone-coin.online",
+  "https://www.ozone-coin.online",
+  CORS_ORIGIN,
+].filter(Boolean);
+function corsOrigin(origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) {
+  if (!origin) return cb(null, true);
+  const allow = ALLOWED_ORIGINS.some((o) => origin === o);
+  cb(null, allow);
+}
 
 let clientPromise: Promise<MongoClient> | null = null;
 
@@ -66,7 +79,7 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 }
 
 const app = express();
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json());
 
 function getClientIp(req: express.Request): string {
