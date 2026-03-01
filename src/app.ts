@@ -1,5 +1,5 @@
 /**
- * Backend API: все данные сохраняются только в MongoDB.
+ * Backend API: данные в MongoDB или в памяти (если MongoDB недоступен / плейсхолдер в .env).
  * Standalone Express server. Set MONGODB_URI, CORS_ORIGIN in .env.
  */
 import "dotenv/config";
@@ -10,12 +10,22 @@ import cors from "cors";
 
 const MONGODB_URI = process.env.MONGODB_URI || "";
 const DB_NAME = "Ozone-coin";
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
+
+/** Использовать память вместо MongoDB: URI пустой или плейсхолдер (нет реального подключения). */
+const useMemoryStorage = !MONGODB_URI?.trim() || MONGODB_URI.includes("USER:PASSWORD");
+
+const memoryClasses: { id: string; name: string }[] = [];
+const memoryStudents: { id: string; name: string; coins: number; classId: string }[] = [];
+const ADMIN_USER = process.env.ADMIN_USER || "admin2026";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "112212";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
 // Разрешаем и http, и https для ozone-coin.online (чтобы работало до и после SSL)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:3000",
   "http://ozone-coin.online",
   "https://ozone-coin.online",
   "http://www.ozone-coin.online",
@@ -111,8 +121,8 @@ app.get("/api/health", async (req, res) => {
 });
 
 app.get("/api/classes", async (_req, res) => {
+  if (useMemoryStorage) return res.json(memoryClasses.map((c) => ({ id: c.id, name: c.name })));
   try {
-    if (!MONGODB_URI?.trim()) return res.json([]);
     const col = await getClassesCol();
     const list = await col.find({}).project({ _id: 1, name: 1 }).toArray();
     return res.json(list.map((c) => ({ id: c._id?.toString(), name: c.name })));
@@ -123,13 +133,17 @@ app.get("/api/classes", async (_req, res) => {
 });
 
 app.get("/api/classes/:classId/students", async (req, res) => {
+  const classId = req.params.classId;
+  if (useMemoryStorage) {
+    const list = memoryStudents.filter((s) => s.classId === classId).sort((a, b) => b.coins - a.coins);
+    return res.json(list.map((s) => ({ id: s.id, name: s.name, coins: s.coins, class_id: s.classId })));
+  }
   let id: ObjectId;
   try {
-    id = new ObjectId(req.params.classId);
+    id = new ObjectId(classId);
   } catch {
     return res.status(400).json({ error: "Invalid class id" });
   }
-  if (!MONGODB_URI?.trim()) return res.json([]);
   try {
     const col = await getStudentsCol();
     const list = await col.find({ classId: id }).sort({ coins: -1 }).toArray();
@@ -164,10 +178,16 @@ app.post("/api/admin/logout", (_req, res) => {
 app.post("/api/classes", requireAdmin, async (req, res) => {
   const { name } = req.body || {};
   if (!name || typeof name !== "string") return res.status(400).json({ error: "Name required" });
+  const trimmed = name.trim();
+  if (useMemoryStorage) {
+    const id = new ObjectId().toString();
+    memoryClasses.push({ id, name: trimmed });
+    return res.json({ id, name: trimmed });
+  }
   try {
     const col = await getClassesCol();
-    const result = await col.insertOne({ name: name.trim() });
-    res.json({ id: result.insertedId.toString(), name: name.trim() });
+    const result = await col.insertOne({ name: trimmed });
+    res.json({ id: result.insertedId.toString(), name: trimmed });
   } catch (e: unknown) {
     console.error(e);
     res.status(500).json({ error: "Sinf qo'shib bo'lmadi", details: e instanceof Error ? e.message : String(e) });
@@ -175,12 +195,22 @@ app.post("/api/classes", requireAdmin, async (req, res) => {
 });
 
 app.delete("/api/classes/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const idx = memoryClasses.findIndex((c) => c.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    memoryClasses.splice(idx, 1);
+    for (let i = memoryStudents.length - 1; i >= 0; i--) {
+      if (memoryStudents[i].classId === id) memoryStudents.splice(i, 1);
+    }
+    return res.json({ success: true });
+  }
   try {
-    const id = new ObjectId(req.params.id);
+    const oid = new ObjectId(id);
     const studentsCol = await getStudentsCol();
     const classesCol = await getClassesCol();
-    await studentsCol.deleteMany({ classId: id });
-    const r = await classesCol.deleteOne({ _id: id });
+    await studentsCol.deleteMany({ classId: oid });
+    const r = await classesCol.deleteOne({ _id: oid });
     if (r.deletedCount === 0) return res.status(404).json({ error: "Not found" });
     res.json({ success: true });
   } catch (e) {
@@ -192,6 +222,15 @@ app.delete("/api/classes/:id", requireAdmin, async (req, res) => {
 app.post("/api/students", requireAdmin, async (req, res) => {
   const { name, classId } = req.body || {};
   if (!name || !classId) return res.status(400).json({ error: "name and classId required" });
+  const cidStr = String(classId);
+  if (useMemoryStorage) {
+    const exists = memoryClasses.some((c) => c.id === cidStr);
+    if (!exists) return res.status(400).json({ error: "Invalid classId" });
+    const id = new ObjectId().toString();
+    const entry = { id, name: String(name).trim(), coins: 0, classId: cidStr };
+    memoryStudents.push(entry);
+    return res.json({ id, name: entry.name, class_id: cidStr, coins: 0 });
+  }
   let cid: ObjectId;
   try {
     cid = new ObjectId(classId);
@@ -209,10 +248,17 @@ app.post("/api/students", requireAdmin, async (req, res) => {
 });
 
 app.delete("/api/students/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const idx = memoryStudents.findIndex((s) => s.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    memoryStudents.splice(idx, 1);
+    return res.json({ success: true });
+  }
   try {
-    const id = new ObjectId(req.params.id);
+    const oid = new ObjectId(id);
     const col = await getStudentsCol();
-    const r = await col.deleteOne({ _id: id });
+    const r = await col.deleteOne({ _id: oid });
     if (r.deletedCount === 0) return res.status(404).json({ error: "Not found" });
     res.json({ success: true });
   } catch (e) {
@@ -225,11 +271,18 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
   const { amount } = req.body || {};
   const num = Number(amount);
   if (Number.isNaN(num)) return res.status(400).json({ error: "amount required" });
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const s = memoryStudents.find((x) => x.id === id);
+    if (!s) return res.status(404).json({ error: "Not found" });
+    s.coins += num;
+    return res.json({ id: s.id, name: s.name, coins: s.coins, class_id: s.classId });
+  }
   try {
-    const id = new ObjectId(req.params.id);
+    const oid = new ObjectId(id);
     const col = await getStudentsCol();
     const updated = await col.findOneAndUpdate(
-      { _id: id },
+      { _id: oid },
       { $inc: { coins: num } },
       { returnDocument: "after" }
     );
