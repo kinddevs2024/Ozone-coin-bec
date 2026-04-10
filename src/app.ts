@@ -16,26 +16,57 @@ const useMemoryStorage = !MONGODB_URI?.trim() || MONGODB_URI.includes("USER:PASS
 
 const memoryClasses: { id: string; name: string }[] = [];
 const memoryStudents: { id: string; name: string; coins: number; classId: string }[] = [];
+const memoryCommunityPosts: {
+  id: string;
+  text: string;
+  imageDataUrl: string | null;
+  createdAt: string;
+  author: "admin";
+}[] = [];
 const ADMIN_USER = process.env.ADMIN_USER || "admin2026";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "112212";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
-// Разрешаем и http, и https для ozone-coin.online (чтобы работало до и после SSL)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
-const ALLOWED_ORIGINS = [
-  "http://localhost:5173",
-  "http://localhost:3000",
-  "http://127.0.0.1:5173",
-  "http://127.0.0.1:3000",
-  "http://ozone-coin.online",
-  "https://ozone-coin.online",
-  "http://www.ozone-coin.online",
-  "https://www.ozone-coin.online",
-  CORS_ORIGIN,
-].filter(Boolean);
+const ALLOWED_ORIGINS = new Set(
+  [
+    "http://ozone-coin.online",
+    "https://ozone-coin.online",
+    "http://www.ozone-coin.online",
+    "https://www.ozone-coin.online",
+    CORS_ORIGIN,
+  ].filter(Boolean)
+);
+
+function isPrivateIpv4(hostname: string): boolean {
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+  const match = hostname.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (!match) return false;
+  const secondOctet = Number(match[1]);
+  return secondOctet >= 16 && secondOctet <= 31;
+}
+
+function isAllowedOrigin(origin: string): boolean {
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+
+  try {
+    const { protocol, hostname } = new URL(origin);
+    const isHttp = protocol === "http:" || protocol === "https:";
+    if (!isHttp) return false;
+
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
+      return true;
+    }
+
+    return isPrivateIpv4(hostname);
+  } catch {
+    return false;
+  }
+}
+
 function corsOrigin(origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) {
   if (!origin) return cb(null, true);
-  const allow = ALLOWED_ORIGINS.some((o) => origin === o);
-  cb(null, allow);
+  cb(null, isAllowedOrigin(origin));
 }
 
 let clientPromise: Promise<MongoClient> | null = null;
@@ -56,6 +87,17 @@ function getClassesCol() {
 function getStudentsCol() {
   return getDb().then((db) =>
     db.collection<{ _id?: ObjectId; name: string; coins: number; classId: ObjectId }>("students")
+  );
+}
+function getCommunityPostsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      text: string;
+      imageDataUrl: string | null;
+      createdAt: string;
+      author: "admin";
+    }>("community_posts")
   );
 }
 
@@ -90,7 +132,7 @@ function requireAdmin(req: express.Request, res: express.Response, next: express
 
 const app = express();
 app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 function getClientIp(req: express.Request): string {
   const forwarded = req.headers["x-forwarded-for"];
@@ -161,6 +203,28 @@ app.get("/api/classes/:classId/students", async (req, res) => {
   }
 });
 
+app.get("/api/community-posts", async (_req, res) => {
+  if (useMemoryStorage) {
+    return res.json([...memoryCommunityPosts].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }
+  try {
+    const col = await getCommunityPostsCol();
+    const list = await col.find({}).sort({ createdAt: -1 }).toArray();
+    return res.json(
+      list.map((post) => ({
+        id: post._id?.toString(),
+        text: post.text || "",
+        imageDataUrl: post.imageDataUrl || null,
+        createdAt: post.createdAt,
+        author: "admin" as const,
+      }))
+    );
+  } catch (e) {
+    console.error("GET /api/community-posts error:", e);
+    return res.status(200).json([]);
+  }
+});
+
 app.post("/api/admin/login", (req, res) => {
   const { user, password } = req.body || {};
   if (user === ADMIN_USER && password === ADMIN_PASSWORD) {
@@ -173,6 +237,44 @@ app.post("/api/admin/login", (req, res) => {
 
 app.post("/api/admin/logout", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.post("/api/community-posts", requireAdmin, async (req, res) => {
+  const trimmedText = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  const imageDataUrl =
+    typeof req.body?.imageDataUrl === "string" && req.body.imageDataUrl.startsWith("data:image/")
+      ? req.body.imageDataUrl
+      : null;
+
+  if (!trimmedText && !imageDataUrl) {
+    return res.status(400).json({ error: "Text or image is required" });
+  }
+  if (imageDataUrl && imageDataUrl.length > 8_000_000) {
+    return res.status(400).json({ error: "Image is too large" });
+  }
+
+  const entry = {
+    text: trimmedText,
+    imageDataUrl,
+    createdAt: new Date().toISOString(),
+    author: "admin" as const,
+  };
+
+  if (useMemoryStorage) {
+    const id = new ObjectId().toString();
+    const post = { id, ...entry };
+    memoryCommunityPosts.unshift(post);
+    return res.json(post);
+  }
+
+  try {
+    const col = await getCommunityPostsCol();
+    const result = await col.insertOne(entry);
+    return res.json({ id: result.insertedId.toString(), ...entry });
+  } catch (e) {
+    console.error("POST /api/community-posts error:", e);
+    return res.status(500).json({ error: "Failed to create community post" });
+  }
 });
 
 app.post("/api/classes", requireAdmin, async (req, res) => {
