@@ -61,6 +61,8 @@ const memoryAssignments: {
   answerImageDataUrl: string | null;
   answerLink: string | null;
   answeredAt: string | null;
+  reviewedAt: string | null;
+  reviewComment: string | null;
 }[] = [];
 const memoryCoinTransactions: {
   id: string;
@@ -196,6 +198,8 @@ function getAssignmentsCol() {
       answerImageDataUrl: string | null;
       answerLink: string | null;
       answeredAt: string | null;
+      reviewedAt: string | null;
+      reviewComment: string | null;
     }>("assignments")
   );
 }
@@ -644,6 +648,8 @@ app.post("/api/student/assignments/:id/answer", requireStudent, async (req, res)
     a.answerImageDataUrl = answerImageDataUrl;
     a.answerLink = answerLink;
     a.answeredAt = answeredAt;
+    a.reviewedAt = null;
+    a.reviewComment = null;
     return res.json({ ok: true, assignment: a });
   }
   try {
@@ -656,6 +662,8 @@ app.post("/api/student/assignments/:id/answer", requireStudent, async (req, res)
           answerImageDataUrl,
           answerLink,
           answeredAt,
+          reviewedAt: null,
+          reviewComment: null,
         },
       },
       { returnDocument: "after" }
@@ -736,6 +744,8 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
       answerImageDataUrl: null,
       answerLink: null,
       answeredAt: null,
+      reviewedAt: null,
+      reviewComment: null,
     };
     memoryAssignments.push(assignment);
     return res.json(assignment);
@@ -759,12 +769,155 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
       answerImageDataUrl: null,
       answerLink: null,
       answeredAt: null,
+      reviewedAt: null,
+      reviewComment: null,
     };
     const result = await col.insertOne(doc);
     return res.json({ id: result.insertedId.toString(), ...doc });
   } catch (e) {
     console.error("POST /api/assignments error:", e);
     return res.status(500).json({ error: "Failed to create assignment" });
+  }
+});
+
+app.post("/api/assignments/class", requireAdmin, async (req, res) => {
+  const classId = String(req.body?.classId ?? "").trim();
+  const title = String(req.body?.title ?? "").trim();
+  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  const imageDataUrlRaw = typeof req.body?.imageDataUrl === "string" ? req.body.imageDataUrl.trim() : "";
+  const imageDataUrl =
+    imageDataUrlRaw.startsWith("data:image/") || /^https?:\/\//i.test(imageDataUrlRaw) ? imageDataUrlRaw : null;
+  const link = typeof req.body?.link === "string" ? req.body.link.trim() : null;
+  const dueAtRaw = typeof req.body?.dueAt === "string" ? req.body.dueAt.trim() : "";
+  const dueDate = dueAtRaw ? new Date(dueAtRaw) : null;
+  const dueAt = dueDate && !Number.isNaN(dueDate.getTime()) ? dueDate.toISOString() : null;
+
+  if (!classId) return res.status(400).json({ error: "classId required" });
+  if (!title) return res.status(400).json({ error: "title required" });
+  if (!text && !imageDataUrl && !link) return res.status(400).json({ error: "text/image/link required" });
+
+  const createdAt = new Date().toISOString();
+  if (useMemoryStorage) {
+    const classStudents = memoryStudents.filter((s) => s.classId === classId);
+    if (classStudents.length === 0) return res.status(404).json({ error: "No students in class" });
+    const inserted = classStudents.map((s) => {
+      const assignment = {
+        id: new ObjectId().toString(),
+        studentId: s.id,
+        classId,
+        title,
+        text,
+        imageDataUrl,
+        link,
+        createdAt,
+        dueAt,
+        answerText: null,
+        answerImageDataUrl: null,
+        answerLink: null,
+        answeredAt: null,
+        reviewedAt: null,
+        reviewComment: null,
+      };
+      memoryAssignments.push(assignment);
+      return assignment.id;
+    });
+    return res.json({ ok: true, count: inserted.length, ids: inserted });
+  }
+
+  try {
+    const studentsCol = await getStudentsCol();
+    const classStudents = await studentsCol.find({ classId: new ObjectId(classId) }).project({ _id: 1 }).toArray();
+    if (classStudents.length === 0) return res.status(404).json({ error: "No students in class" });
+    const docs = classStudents.map((s) => ({
+      studentId: s._id!.toString(),
+      classId,
+      title,
+      text,
+      imageDataUrl,
+      link,
+      createdAt,
+      dueAt,
+      answerText: null,
+      answerImageDataUrl: null,
+      answerLink: null,
+      answeredAt: null,
+      reviewedAt: null,
+      reviewComment: null,
+    }));
+    const col = await getAssignmentsCol();
+    const result = await col.insertMany(docs);
+    return res.json({ ok: true, count: result.insertedCount });
+  } catch (e) {
+    console.error("POST /api/assignments/class error:", e);
+    return res.status(500).json({ error: "Failed to create class assignments" });
+  }
+});
+
+app.get("/api/admin/assignments", requireAdmin, async (_req, res) => {
+  if (useMemoryStorage) {
+    const list = memoryAssignments
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .map((a) => {
+        const st = memoryStudents.find((s) => s.id === a.studentId);
+        const cls = memoryClasses.find((c) => c.id === a.classId);
+        return {
+          ...a,
+          studentName: st?.name ?? "Unknown",
+          className: cls?.name ?? "Unknown",
+        };
+      });
+    return res.json(list);
+  }
+
+  try {
+    const col = await getAssignmentsCol();
+    const studentsCol = await getStudentsCol();
+    const classesCol = await getClassesCol();
+    const list = await col.find({}).sort({ createdAt: -1 }).toArray();
+    const out = [];
+    for (const a of list) {
+      const st = await studentsCol.findOne({ _id: new ObjectId(a.studentId) });
+      const cls = await classesCol.findOne({ _id: new ObjectId(a.classId) });
+      out.push({
+        id: a._id?.toString(),
+        ...a,
+        studentName: st?.name ?? "Unknown",
+        className: cls?.name ?? "Unknown",
+      });
+    }
+    return res.json(out);
+  } catch (e) {
+    console.error("GET /api/admin/assignments error:", e);
+    return res.status(500).json({ error: "Failed to get assignments" });
+  }
+});
+
+app.patch("/api/admin/assignments/:id/review", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const reviewComment = typeof req.body?.reviewComment === "string" ? req.body.reviewComment.trim() : "";
+  const reviewedAt = new Date().toISOString();
+
+  if (useMemoryStorage) {
+    const a = memoryAssignments.find((x) => x.id === id);
+    if (!a) return res.status(404).json({ error: "Assignment not found" });
+    a.reviewedAt = reviewedAt;
+    a.reviewComment = reviewComment || null;
+    return res.json({ ok: true, assignment: a });
+  }
+
+  try {
+    const col = await getAssignmentsCol();
+    const updated = await col.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { reviewedAt, reviewComment: reviewComment || null } },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(404).json({ error: "Assignment not found" });
+    return res.json({ ok: true, assignment: { id: updated._id?.toString(), ...updated } });
+  } catch (e) {
+    console.error("PATCH /api/admin/assignments/:id/review error:", e);
+    return res.status(500).json({ error: "Failed to review assignment" });
   }
 });
 
