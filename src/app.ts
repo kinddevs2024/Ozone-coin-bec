@@ -959,10 +959,10 @@ app.post("/api/students", requireAdmin, async (req, res) => {
   if (useMemoryStorage) {
     const exists = memoryClasses.some((c) => c.id === cidStr);
     if (!exists) return res.status(400).json({ error: "Invalid classId" });
-    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.local`;
+    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
     let email = baseEmail;
     while (memoryStudents.some((s) => s.email.toLowerCase() === email.toLowerCase())) {
-      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.local`;
+      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
     }
     const tempPassword = randomTempPassword();
     const id = new ObjectId().toString();
@@ -996,10 +996,10 @@ app.post("/api/students", requireAdmin, async (req, res) => {
   }
   try {
     const col = await getStudentsCol();
-    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.local`;
+    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
     let email = baseEmail;
     while (await col.findOne({ email })) {
-      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.local`;
+      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
     }
     const tempPassword = randomTempPassword();
     const result = await col.insertOne({
