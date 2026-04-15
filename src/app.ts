@@ -23,6 +23,20 @@ const memoryCommunityPosts: {
   createdAt: string;
   author: "admin";
 }[] = [];
+const memoryAnalytics: {
+  id: string;
+  classId: string;
+  className: string;
+  resetAt: string;
+  type: "manual" | "auto";
+  studentsBefore: { name: string; coins: number }[];
+}[] = [];
+const memoryAutoReset: {
+  id: string;
+  classId: string;
+  firstCoinAt: string;
+  lastResetAt: string | null;
+}[] = [];
 const ADMIN_USER = process.env.ADMIN_USER || "admin2026";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "112212";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
@@ -98,6 +112,28 @@ function getCommunityPostsCol() {
       createdAt: string;
       author: "admin";
     }>("community_posts")
+  );
+}
+function getAnalyticsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      classId: string;
+      className: string;
+      resetAt: string;
+      type: "manual" | "auto";
+      studentsBefore: { name: string; coins: number }[];
+    }>("reset_analytics")
+  );
+}
+function getAutoResetCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      classId: string;
+      firstCoinAt: string;
+      lastResetAt: string | null;
+    }>("auto_reset_tracking")
   );
 }
 
@@ -277,6 +313,157 @@ app.post("/api/community-posts", requireAdmin, async (req, res) => {
   }
 });
 
+app.delete("/api/community-posts/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const idx = memoryCommunityPosts.findIndex((p) => p.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    memoryCommunityPosts.splice(idx, 1);
+    return res.json({ success: true });
+  }
+  try {
+    const oid = new ObjectId(id);
+    const col = await getCommunityPostsCol();
+    const r = await col.deleteOne({ _id: oid });
+    if (r.deletedCount === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true });
+  } catch (e) {
+    console.error("DELETE /api/community-posts/:id error:", e);
+    res.status(500).json({ error: "Failed to delete post" });
+  }
+});
+
+app.put("/api/community-posts/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const trimmedText = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+  const imageDataUrl =
+    typeof req.body?.imageDataUrl === "string" && req.body.imageDataUrl.startsWith("data:image/")
+      ? req.body.imageDataUrl
+      : null;
+  const keepImage = req.body?.keepImage === true;
+
+  if (!trimmedText && !imageDataUrl && !keepImage) {
+    return res.status(400).json({ error: "Text or image is required" });
+  }
+
+  if (useMemoryStorage) {
+    const post = memoryCommunityPosts.find((p) => p.id === id);
+    if (!post) return res.status(404).json({ error: "Not found" });
+    post.text = trimmedText;
+    if (imageDataUrl) post.imageDataUrl = imageDataUrl;
+    else if (!keepImage) post.imageDataUrl = null;
+    return res.json(post);
+  }
+
+  try {
+    const oid = new ObjectId(id);
+    const col = await getCommunityPostsCol();
+    const update: Record<string, unknown> = { text: trimmedText };
+    if (imageDataUrl) update.imageDataUrl = imageDataUrl;
+    else if (!keepImage) update.imageDataUrl = null;
+    const updated = await col.findOneAndUpdate(
+      { _id: oid },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(404).json({ error: "Not found" });
+    res.json({
+      id: updated._id?.toString(),
+      text: updated.text || "",
+      imageDataUrl: updated.imageDataUrl || null,
+      createdAt: updated.createdAt,
+      author: "admin" as const,
+    });
+  } catch (e) {
+    console.error("PUT /api/community-posts/:id error:", e);
+    res.status(500).json({ error: "Failed to update post" });
+  }
+});
+
+app.get("/api/analytics", async (_req, res) => {
+  if (useMemoryStorage) {
+    return res.json([...memoryAnalytics].sort((a, b) => b.resetAt.localeCompare(a.resetAt)));
+  }
+  try {
+    const col = await getAnalyticsCol();
+    const list = await col.find({}).sort({ resetAt: -1 }).toArray();
+    return res.json(
+      list.map((a) => ({
+        id: a._id?.toString(),
+        classId: a.classId,
+        className: a.className,
+        resetAt: a.resetAt,
+        type: a.type,
+        studentsBefore: a.studentsBefore,
+      }))
+    );
+  } catch (e) {
+    console.error("GET /api/analytics error:", e);
+    return res.status(200).json([]);
+  }
+});
+
+app.post("/api/classes/:classId/reset-coins", requireAdmin, async (req, res) => {
+  const classId = req.params.classId;
+
+  if (useMemoryStorage) {
+    const cls = memoryClasses.find((c) => c.id === classId);
+    if (!cls) return res.status(404).json({ error: "Class not found" });
+    const classStudents = memoryStudents.filter((s) => s.classId === classId);
+    const studentsBefore = classStudents.map((s) => ({ name: s.name, coins: s.coins }));
+    classStudents.forEach((s) => { s.coins = 0; });
+    const entry = {
+      id: new ObjectId().toString(),
+      classId,
+      className: cls.name,
+      resetAt: new Date().toISOString(),
+      type: "manual" as const,
+      studentsBefore,
+    };
+    memoryAnalytics.push(entry);
+    const arIdx = memoryAutoReset.findIndex((a) => a.classId === classId);
+    if (arIdx !== -1) {
+      memoryAutoReset[arIdx].lastResetAt = entry.resetAt;
+      memoryAutoReset[arIdx].firstCoinAt = entry.resetAt;
+    }
+    return res.json(entry);
+  }
+
+  try {
+    const classOid = new ObjectId(classId);
+    const classesCol = await getClassesCol();
+    const cls = await classesCol.findOne({ _id: classOid });
+    if (!cls) return res.status(404).json({ error: "Class not found" });
+
+    const studentsCol = await getStudentsCol();
+    const studentsList = await studentsCol.find({ classId: classOid }).toArray();
+    const studentsBefore = studentsList.map((s) => ({ name: s.name, coins: s.coins }));
+
+    await studentsCol.updateMany({ classId: classOid }, { $set: { coins: 0 } });
+
+    const analyticsEntry = {
+      classId,
+      className: cls.name,
+      resetAt: new Date().toISOString(),
+      type: "manual" as const,
+      studentsBefore,
+    };
+    const analyticsCol = await getAnalyticsCol();
+    const result = await analyticsCol.insertOne(analyticsEntry);
+
+    const autoResetCol = await getAutoResetCol();
+    await autoResetCol.updateOne(
+      { classId },
+      { $set: { lastResetAt: analyticsEntry.resetAt, firstCoinAt: analyticsEntry.resetAt } }
+    );
+
+    return res.json({ id: result.insertedId.toString(), ...analyticsEntry });
+  } catch (e) {
+    console.error("POST /api/classes/:classId/reset-coins error:", e);
+    return res.status(500).json({ error: "Failed to reset coins" });
+  }
+});
+
 app.post("/api/classes", requireAdmin, async (req, res) => {
   const { name } = req.body || {};
   if (!name || typeof name !== "string") return res.status(400).json({ error: "Name required" });
@@ -378,6 +565,17 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
     const s = memoryStudents.find((x) => x.id === id);
     if (!s) return res.status(404).json({ error: "Not found" });
     s.coins += num;
+    if (num > 0) {
+      const existing = memoryAutoReset.find((a) => a.classId === s.classId);
+      if (!existing) {
+        memoryAutoReset.push({
+          id: new ObjectId().toString(),
+          classId: s.classId,
+          firstCoinAt: new Date().toISOString(),
+          lastResetAt: null,
+        });
+      }
+    }
     return res.json({ id: s.id, name: s.name, coins: s.coins, class_id: s.classId });
   }
   try {
@@ -389,6 +587,20 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
       { returnDocument: "after" }
     );
     if (!updated) return res.status(404).json({ error: "Not found" });
+
+    if (num > 0) {
+      const autoResetCol = await getAutoResetCol();
+      const classId = updated.classId.toString();
+      const existing = await autoResetCol.findOne({ classId });
+      if (!existing) {
+        await autoResetCol.insertOne({
+          classId,
+          firstCoinAt: new Date().toISOString(),
+          lastResetAt: null,
+        });
+      }
+    }
+
     res.json({
       id: updated._id?.toString(),
       name: updated.name,
@@ -400,5 +612,80 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to update coins" });
   }
 });
+
+const AUTO_RESET_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+async function checkAutoResets() {
+  const now = Date.now();
+
+  if (useMemoryStorage) {
+    for (const ar of memoryAutoReset) {
+      const referenceDate = ar.lastResetAt || ar.firstCoinAt;
+      if (now - new Date(referenceDate).getTime() >= AUTO_RESET_INTERVAL_MS) {
+        const cls = memoryClasses.find((c) => c.id === ar.classId);
+        if (!cls) continue;
+        const classStudents = memoryStudents.filter((s) => s.classId === ar.classId);
+        const studentsBefore = classStudents.map((s) => ({ name: s.name, coins: s.coins }));
+        classStudents.forEach((s) => { s.coins = 0; });
+        const resetAt = new Date().toISOString();
+        memoryAnalytics.push({
+          id: new ObjectId().toString(),
+          classId: ar.classId,
+          className: cls.name,
+          resetAt,
+          type: "auto",
+          studentsBefore,
+        });
+        ar.lastResetAt = resetAt;
+        ar.firstCoinAt = resetAt;
+        console.log(`[Auto-reset] Class "${cls.name}" coins reset (memory)`);
+      }
+    }
+    return;
+  }
+
+  try {
+    const autoResetCol = await getAutoResetCol();
+    const trackings = await autoResetCol.find({}).toArray();
+
+    for (const tracking of trackings) {
+      const referenceDate = tracking.lastResetAt || tracking.firstCoinAt;
+      if (now - new Date(referenceDate).getTime() >= AUTO_RESET_INTERVAL_MS) {
+        const classOid = new ObjectId(tracking.classId);
+        const classesCol = await getClassesCol();
+        const cls = await classesCol.findOne({ _id: classOid });
+        if (!cls) continue;
+
+        const studentsCol = await getStudentsCol();
+        const studentsList = await studentsCol.find({ classId: classOid }).toArray();
+        const studentsBefore = studentsList.map((s) => ({ name: s.name, coins: s.coins }));
+
+        await studentsCol.updateMany({ classId: classOid }, { $set: { coins: 0 } });
+
+        const resetAt = new Date().toISOString();
+        const analyticsCol = await getAnalyticsCol();
+        await analyticsCol.insertOne({
+          classId: tracking.classId,
+          className: cls.name,
+          resetAt,
+          type: "auto",
+          studentsBefore,
+        });
+
+        await autoResetCol.updateOne(
+          { _id: tracking._id },
+          { $set: { lastResetAt: resetAt, firstCoinAt: resetAt } }
+        );
+
+        console.log(`[Auto-reset] Class "${cls.name}" coins reset (MongoDB)`);
+      }
+    }
+  } catch (e) {
+    console.error("[Auto-reset] Error:", e);
+  }
+}
+
+checkAutoResets();
+setInterval(checkAutoResets, 60 * 60 * 1000);
 
 export default app;
