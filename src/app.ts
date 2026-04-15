@@ -539,6 +539,71 @@ app.get("/api/student/me", requireStudent, async (req, res) => {
   }
 });
 
+app.patch("/api/student/profile", requireStudent, async (req, res) => {
+  const studentId = (req as express.Request & { studentId?: string }).studentId;
+  if (!studentId) return res.status(401).json({ error: "Unauthorized" });
+
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  const newPassword = typeof req.body?.newPassword === "string" ? req.body.newPassword : "";
+
+  const updateName = name.length > 0;
+  const updatePassword = newPassword.length > 0;
+  if (!updateName && !updatePassword) {
+    return res.status(400).json({ error: "Nothing to update" });
+  }
+  if (updateName && name.length < 2) {
+    return res.status(400).json({ error: "Name too short" });
+  }
+  if (updatePassword && newPassword.length < 6) {
+    return res.status(400).json({ error: "Password too short" });
+  }
+
+  if (useMemoryStorage) {
+    const st = memoryStudents.find((s) => s.id === studentId);
+    if (!st) return res.status(404).json({ error: "Student not found" });
+    if (updateName) st.name = name;
+    if (updatePassword) {
+      st.passwordHash = hashPassword(newPassword);
+      st.mustChangePassword = false;
+      st.initialPassword = null;
+    }
+    return res.json({
+      ok: true,
+      student: { id: st.id, name: st.name, email: st.email, class_id: st.classId, coins: st.coins },
+    });
+  }
+
+  try {
+    const col = await getStudentsCol();
+    const update: Record<string, unknown> = {};
+    if (updateName) update.name = name;
+    if (updatePassword) {
+      update.passwordHash = hashPassword(newPassword);
+      update.mustChangePassword = false;
+      update.initialPassword = null;
+    }
+    const updated = await col.findOneAndUpdate(
+      { _id: new ObjectId(studentId) },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(404).json({ error: "Student not found" });
+    return res.json({
+      ok: true,
+      student: {
+        id: updated._id?.toString(),
+        name: updated.name,
+        email: updated.email,
+        class_id: updated.classId.toString(),
+        coins: updated.coins,
+      },
+    });
+  } catch (e) {
+    console.error("PATCH /api/student/profile error:", e);
+    return res.status(500).json({ error: "Failed to update profile" });
+  }
+});
+
 app.get("/api/student/assignments", requireStudent, async (req, res) => {
   const studentId = (req as express.Request & { studentId?: string }).studentId;
   if (!studentId) return res.status(401).json({ error: "Unauthorized" });
