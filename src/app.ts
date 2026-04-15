@@ -51,10 +51,12 @@ const memoryAssignments: {
   id: string;
   studentId: string;
   classId: string;
+  title: string;
   text: string;
   imageDataUrl: string | null;
   link: string | null;
   createdAt: string;
+  dueAt: string | null;
   answerText: string | null;
   answerImageDataUrl: string | null;
   answerLink: string | null;
@@ -184,10 +186,12 @@ function getAssignmentsCol() {
       _id?: ObjectId;
       studentId: string;
       classId: string;
+      title: string;
       text: string;
       imageDataUrl: string | null;
       link: string | null;
       createdAt: string;
+      dueAt: string | null;
       answerText: string | null;
       answerImageDataUrl: string | null;
       answerLink: string | null;
@@ -636,12 +640,17 @@ app.post("/api/admin/logout", (_req, res) => {
 app.post("/api/assignments", requireAdmin, async (req, res) => {
   const studentId = String(req.body?.studentId ?? "").trim();
   const classId = String(req.body?.classId ?? "").trim();
+  const title = String(req.body?.title ?? "").trim();
   const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
   const imageDataUrlRaw = typeof req.body?.imageDataUrl === "string" ? req.body.imageDataUrl.trim() : "";
   const imageDataUrl =
     imageDataUrlRaw.startsWith("data:image/") || /^https?:\/\//i.test(imageDataUrlRaw) ? imageDataUrlRaw : null;
   const link = typeof req.body?.link === "string" ? req.body.link.trim() : null;
+  const dueAtRaw = typeof req.body?.dueAt === "string" ? req.body.dueAt.trim() : "";
+  const dueDate = dueAtRaw ? new Date(dueAtRaw) : null;
+  const dueAt = dueDate && !Number.isNaN(dueDate.getTime()) ? dueDate.toISOString() : null;
   if (!studentId || !classId) return res.status(400).json({ error: "studentId and classId required" });
+  if (!title) return res.status(400).json({ error: "title required" });
   if (!text && !imageDataUrl && !link) return res.status(400).json({ error: "text/image/link required" });
 
   const createdAt = new Date().toISOString();
@@ -652,10 +661,12 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
       id: new ObjectId().toString(),
       studentId,
       classId,
+      title,
       text,
       imageDataUrl,
       link,
       createdAt,
+      dueAt,
       answerText: null,
       answerImageDataUrl: null,
       answerLink: null,
@@ -673,10 +684,12 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
     const doc = {
       studentId,
       classId,
+      title,
       text,
       imageDataUrl,
       link,
       createdAt,
+      dueAt,
       answerText: null,
       answerImageDataUrl: null,
       answerLink: null,
