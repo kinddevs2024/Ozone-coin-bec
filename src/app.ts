@@ -74,6 +74,24 @@ const memoryCoinTransactions: {
   note: string;
   createdAt: string;
 }[] = [];
+/** Haftalik dars slotlari: weekday 0 = dushanba … 6 = yakshanba */
+const memoryScheduleSlots: {
+  id: string;
+  classId: string;
+  weekday: number;
+  title: string;
+  startTime: string;
+  endTime: string;
+}[] = [];
+const memoryLessonAttendance: {
+  id: string;
+  classId: string;
+  date: string;
+  scheduleSlotId: string;
+  studentId: string;
+  present: boolean;
+  updatedAt: string;
+}[] = [];
 const ADMIN_USER = process.env.ADMIN_USER || "admin2026";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "112212";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
@@ -218,6 +236,31 @@ function getCoinTransactionsCol() {
     }>("coin_transactions")
   );
 }
+function getScheduleSlotsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      classId: string;
+      weekday: number;
+      title: string;
+      startTime: string;
+      endTime: string;
+    }>("schedule_slots")
+  );
+}
+function getLessonAttendanceCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      classId: string;
+      date: string;
+      scheduleSlotId: string;
+      studentId: string;
+      present: boolean;
+      updatedAt: string;
+    }>("lesson_attendance")
+  );
+}
 
 function signToken(payload: { a: number; exp: number }): string {
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -307,6 +350,29 @@ function getMonthKey(iso: string): string {
 }
 function getDayKey(iso: string): string {
   return iso.slice(0, 10);
+}
+
+function utcMondayFromWeekStartParam(weekStart?: string): Date {
+  const raw = typeof weekStart === "string" ? weekStart.trim() : "";
+  const base = raw ? new Date(`${raw}T12:00:00.000Z`) : new Date();
+  if (Number.isNaN(base.getTime())) return new Date();
+  const dow = base.getUTCDay();
+  const diff = dow === 0 ? -6 : 1 - dow;
+  return new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate() + diff));
+}
+
+function addUtcDays(d: Date, n: number): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + n));
+}
+
+function formatUtcYmd(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/** 0 = dushanba … 6 = yakshanba (ISO hafta boshidan) */
+function mondayBasedWeekdayFromUtcDate(d: Date): number {
+  const dow = d.getUTCDay();
+  return dow === 0 ? 6 : dow - 1;
 }
 function coerceNonNegativeInt(value: unknown): number {
   const num = Number(value);
@@ -1265,7 +1331,7 @@ app.put("/api/community-posts/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/api/analytics", async (_req, res) => {
+app.get("/api/analytics", requireAdmin, async (_req, res) => {
   if (useMemoryStorage) {
     return res.json([...memoryAnalytics].sort((a, b) => b.resetAt.localeCompare(a.resetAt)));
   }
@@ -1288,7 +1354,7 @@ app.get("/api/analytics", async (_req, res) => {
   }
 });
 
-app.get("/api/analytics/overview", async (_req, res) => {
+app.get("/api/analytics/overview", requireAdmin, async (_req, res) => {
   if (useMemoryStorage) {
     return res.json({
       classesCount: memoryClasses.length,
@@ -1311,7 +1377,7 @@ app.get("/api/analytics/overview", async (_req, res) => {
   }
 });
 
-app.get("/api/coin-stats", async (req, res) => {
+app.get("/api/coin-stats", requireAdmin, async (req, res) => {
   const rawMode = typeof req.query.mode === "string" ? req.query.mode : "day";
   const mode: "day" | "month" | "custom" =
     rawMode === "month" || rawMode === "custom" ? rawMode : "day";
@@ -1390,6 +1456,450 @@ app.get("/api/coin-stats", async (req, res) => {
   } catch (e) {
     console.error("GET /api/coin-stats error:", e);
     return res.status(500).json({ error: "Failed to get coin stats" });
+  }
+});
+
+app.get("/api/admin/schedule-slots", requireAdmin, async (req, res) => {
+  const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
+  if (!classId) return res.status(400).json({ error: "classId required" });
+  if (useMemoryStorage) {
+    const slots = memoryScheduleSlots
+      .filter((s) => s.classId === classId)
+      .slice()
+      .sort((a, b) => a.weekday - b.weekday || a.startTime.localeCompare(b.startTime));
+    return res.json(slots);
+  }
+  try {
+    const col = await getScheduleSlotsCol();
+    const list = await col.find({ classId }).sort({ weekday: 1, startTime: 1 }).toArray();
+    return res.json(
+      list.map((s) => ({
+        id: s._id?.toString(),
+        classId: s.classId,
+        weekday: s.weekday,
+        title: s.title || "",
+        startTime: s.startTime,
+        endTime: s.endTime,
+      }))
+    );
+  } catch (e) {
+    console.error("GET /api/admin/schedule-slots error:", e);
+    return res.status(500).json({ error: "Failed to list schedule" });
+  }
+});
+
+app.get("/api/admin/schedule-week", requireAdmin, async (req, res) => {
+  const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
+  const weekStart = typeof req.query.weekStart === "string" ? req.query.weekStart.trim() : "";
+  if (!classId) return res.status(400).json({ error: "classId required" });
+  const monday = utcMondayFromWeekStartParam(weekStart || undefined);
+  if (useMemoryStorage) {
+    const slots = memoryScheduleSlots.filter((s) => s.classId === classId);
+    const dayLabels = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"];
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const d = addUtcDays(monday, i);
+      const w = mondayBasedWeekdayFromUtcDate(d);
+      days.push({
+        date: formatUtcYmd(d),
+        weekday: w,
+        label: dayLabels[w] ?? String(w),
+        slots: slots.filter((s) => s.weekday === w).sort((a, b) => a.startTime.localeCompare(b.startTime)),
+      });
+    }
+    return res.json({ weekStart: formatUtcYmd(monday), days });
+  }
+  try {
+    const col = await getScheduleSlotsCol();
+    const list = await col.find({ classId }).toArray();
+    const slots = list.map((s) => ({
+      id: s._id?.toString(),
+      classId: s.classId,
+      weekday: s.weekday,
+      title: s.title || "",
+      startTime: s.startTime,
+      endTime: s.endTime,
+    }));
+    const dayLabels = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"];
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const d = addUtcDays(monday, i);
+      const w = mondayBasedWeekdayFromUtcDate(d);
+      days.push({
+        date: formatUtcYmd(d),
+        weekday: w,
+        label: dayLabels[w] ?? String(w),
+        slots: slots.filter((s) => s.weekday === w).sort((a, b) => a.startTime.localeCompare(b.startTime)),
+      });
+    }
+    return res.json({ weekStart: formatUtcYmd(monday), days });
+  } catch (e) {
+    console.error("GET /api/admin/schedule-week error:", e);
+    return res.status(500).json({ error: "Failed to load week schedule" });
+  }
+});
+
+app.post("/api/admin/schedule-slots", requireAdmin, async (req, res) => {
+  const classId = String(req.body?.classId ?? "").trim();
+  const weekday = Number(req.body?.weekday);
+  const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+  const startTime = String(req.body?.startTime ?? "").trim();
+  const endTime = String(req.body?.endTime ?? "").trim();
+  if (!classId) return res.status(400).json({ error: "classId required" });
+  if (!Number.isFinite(weekday) || weekday < 0 || weekday > 6) return res.status(400).json({ error: "weekday 0-6 required" });
+  if (!/^\d{1,2}:\d{2}$/.test(startTime) || !/^\d{1,2}:\d{2}$/.test(endTime)) {
+    return res.status(400).json({ error: "startTime and endTime as HH:mm required" });
+  }
+  if (useMemoryStorage) {
+    const id = new ObjectId().toString();
+    const slot = { id, classId, weekday, title, startTime, endTime };
+    memoryScheduleSlots.push(slot);
+    return res.json(slot);
+  }
+  try {
+    const col = await getScheduleSlotsCol();
+    const result = await col.insertOne({ classId, weekday, title, startTime, endTime });
+    return res.json({
+      id: result.insertedId.toString(),
+      classId,
+      weekday,
+      title,
+      startTime,
+      endTime,
+    });
+  } catch (e) {
+    console.error("POST /api/admin/schedule-slots error:", e);
+    return res.status(500).json({ error: "Failed to add slot" });
+  }
+});
+
+app.delete("/api/admin/schedule-slots/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const idx = memoryScheduleSlots.findIndex((s) => s.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    memoryScheduleSlots.splice(idx, 1);
+    return res.json({ success: true });
+  }
+  try {
+    const col = await getScheduleSlotsCol();
+    const r = await col.deleteOne({ _id: new ObjectId(id) });
+    if (r.deletedCount === 0) return res.status(404).json({ error: "Not found" });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("DELETE /api/admin/schedule-slots error:", e);
+    return res.status(500).json({ error: "Failed to delete slot" });
+  }
+});
+
+app.get("/api/admin/attendance", requireAdmin, async (req, res) => {
+  const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
+  const date = typeof req.query.date === "string" ? req.query.date.trim() : "";
+  const scheduleSlotId = typeof req.query.scheduleSlotId === "string" ? req.query.scheduleSlotId.trim() : "";
+  if (!classId || !date || !scheduleSlotId) {
+    return res.status(400).json({ error: "classId, date, scheduleSlotId required" });
+  }
+  if (useMemoryStorage) {
+    const students = memoryStudents
+      .filter((s) => s.classId === classId)
+      .map((s) => ({ id: s.id, name: s.name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const attendance: Record<string, boolean> = {};
+    for (const row of memoryLessonAttendance) {
+      if (row.classId === classId && row.date === date && row.scheduleSlotId === scheduleSlotId) {
+        attendance[row.studentId] = row.present;
+      }
+    }
+    return res.json({ students, attendance });
+  }
+  try {
+    const studentsCol = await getStudentsCol();
+    const list = await studentsCol.find({ classId: new ObjectId(classId) }).sort({ name: 1 }).toArray();
+    const students = list.map((s) => ({ id: s._id!.toString(), name: s.name }));
+    const attCol = await getLessonAttendanceCol();
+    const rows = await attCol.find({ classId, date, scheduleSlotId }).toArray();
+    const attendance: Record<string, boolean> = {};
+    for (const row of rows) {
+      attendance[row.studentId] = row.present;
+    }
+    return res.json({ students, attendance });
+  } catch (e) {
+    console.error("GET /api/admin/attendance error:", e);
+    return res.status(500).json({ error: "Failed to load attendance" });
+  }
+});
+
+app.put("/api/admin/attendance", requireAdmin, async (req, res) => {
+  const classId = String(req.body?.classId ?? "").trim();
+  const date = String(req.body?.date ?? "").trim();
+  const scheduleSlotId = String(req.body?.scheduleSlotId ?? "").trim();
+  const attendance = req.body?.attendance;
+  if (!classId || !date || !scheduleSlotId) {
+    return res.status(400).json({ error: "classId, date, scheduleSlotId required" });
+  }
+  if (!attendance || typeof attendance !== "object") {
+    return res.status(400).json({ error: "attendance object required" });
+  }
+  const updatedAt = new Date().toISOString();
+  if (useMemoryStorage) {
+    for (let i = memoryLessonAttendance.length - 1; i >= 0; i--) {
+      const r = memoryLessonAttendance[i];
+      if (r.classId === classId && r.date === date && r.scheduleSlotId === scheduleSlotId) {
+        memoryLessonAttendance.splice(i, 1);
+      }
+    }
+    for (const [studentId, present] of Object.entries(attendance as Record<string, unknown>)) {
+      if (typeof present !== "boolean") continue;
+      memoryLessonAttendance.push({
+        id: new ObjectId().toString(),
+        classId,
+        date,
+        scheduleSlotId,
+        studentId,
+        present,
+        updatedAt,
+      });
+    }
+    return res.json({ ok: true });
+  }
+  try {
+    const attCol = await getLessonAttendanceCol();
+    await attCol.deleteMany({ classId, date, scheduleSlotId });
+    const docs = Object.entries(attendance as Record<string, unknown>)
+      .filter(([, v]) => typeof v === "boolean")
+      .map(([studentId, present]) => ({
+        classId,
+        date,
+        scheduleSlotId,
+        studentId,
+        present: present as boolean,
+        updatedAt,
+      }));
+    if (docs.length) await attCol.insertMany(docs);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("PUT /api/admin/attendance error:", e);
+    return res.status(500).json({ error: "Failed to save attendance" });
+  }
+});
+
+app.get("/api/admin/reports/daily", requireAdmin, async (req, res) => {
+  const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
+  const date = typeof req.query.date === "string" ? req.query.date.trim() : "";
+  if (!classId || !date) return res.status(400).json({ error: "classId and date required" });
+
+  const sumCoinsForStudentOnDay = (studentId: string): number => {
+    if (useMemoryStorage) {
+      return memoryCoinTransactions
+        .filter((t) => t.studentId === studentId && t.classId === classId && t.type !== "reset" && getDayKey(t.createdAt) === date)
+        .reduce((s, t) => s + t.amount, 0);
+    }
+    return 0;
+  };
+
+  if (useMemoryStorage) {
+    const d = new Date(`${date}T12:00:00.000Z`);
+    const w = mondayBasedWeekdayFromUtcDate(d);
+    const slots = memoryScheduleSlots.filter((s) => s.classId === classId && s.weekday === w).sort((a, b) => a.startTime.localeCompare(b.startTime));
+    const students = memoryStudents
+      .filter((s) => s.classId === classId)
+      .map((s) => ({ id: s.id, name: s.name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const rows = students.map((st) => {
+      const slotPresence = slots.map((slot) => {
+        const row = memoryLessonAttendance.find(
+          (a) => a.classId === classId && a.date === date && a.scheduleSlotId === slot.id && a.studentId === st.id
+        );
+        return {
+          scheduleSlotId: slot.id,
+          title: slot.title,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          present: row ? row.present : null,
+        };
+      });
+      return {
+        studentId: st.id,
+        studentName: st.name,
+        coinsDay: sumCoinsForStudentOnDay(st.id),
+        slots: slotPresence,
+      };
+    });
+    return res.json({ date, classId, slots, rows });
+  }
+
+  try {
+    const d = new Date(`${date}T12:00:00.000Z`);
+    const w = mondayBasedWeekdayFromUtcDate(d);
+    const slotsCol = await getScheduleSlotsCol();
+    const slotDocs = await slotsCol.find({ classId, weekday: w }).sort({ startTime: 1 }).toArray();
+    const slots = slotDocs.map((s) => ({
+      id: s._id!.toString(),
+      classId: s.classId,
+      weekday: s.weekday,
+      title: s.title || "",
+      startTime: s.startTime,
+      endTime: s.endTime,
+    }));
+    const studentsCol = await getStudentsCol();
+    const stList = await studentsCol.find({ classId: new ObjectId(classId) }).sort({ name: 1 }).toArray();
+    const attCol = await getLessonAttendanceCol();
+    const attRows = await attCol.find({ classId, date }).toArray();
+    const attMap = new Map<string, { slotId: string; present: boolean }[]>();
+    for (const a of attRows) {
+      const key = a.studentId;
+      if (!attMap.has(key)) attMap.set(key, []);
+      attMap.get(key)!.push({ slotId: a.scheduleSlotId, present: a.present });
+    }
+    const txCol = await getCoinTransactionsCol();
+    const txList = await txCol
+      .find({
+        classId,
+        type: { $ne: "reset" },
+        createdAt: { $gte: `${date}T00:00:00.000Z`, $lte: `${date}T23:59:59.999Z` },
+      })
+      .toArray();
+    const coinsByStudent = new Map<string, number>();
+    for (const t of txList) {
+      coinsByStudent.set(t.studentId, (coinsByStudent.get(t.studentId) ?? 0) + t.amount);
+    }
+    const rows = stList.map((st) => {
+      const sid = st._id!.toString();
+      const list = attMap.get(sid) ?? [];
+      const slotPresence = slots.map((slot) => {
+        const found = list.find((x) => x.slotId === slot.id);
+        return {
+          scheduleSlotId: slot.id,
+          title: slot.title,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          present: found ? found.present : null,
+        };
+      });
+      return {
+        studentId: sid,
+        studentName: st.name,
+        coinsDay: coinsByStudent.get(sid) ?? 0,
+        slots: slotPresence,
+      };
+    });
+    return res.json({ date, classId, slots, rows });
+  } catch (e) {
+    console.error("GET /api/admin/reports/daily error:", e);
+    return res.status(500).json({ error: "Failed to build report" });
+  }
+});
+
+app.get("/api/admin/reports/range", requireAdmin, async (req, res) => {
+  const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
+  const from = typeof req.query.from === "string" ? req.query.from.trim() : "";
+  const to = typeof req.query.to === "string" ? req.query.to.trim() : "";
+  if (!classId || !from || !to) return res.status(400).json({ error: "classId, from, to required (YYYY-MM-DD)" });
+  const start = new Date(`${from}T00:00:00.000Z`);
+  const end = new Date(`${to}T23:59:59.999Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+    return res.status(400).json({ error: "Invalid date range" });
+  }
+
+  if (useMemoryStorage) {
+    const dates: string[] = [];
+    const cur = new Date(start);
+    while (cur <= end) {
+      dates.push(formatUtcYmd(cur));
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    const students = memoryStudents.filter((s) => s.classId === classId).sort((a, b) => a.name.localeCompare(b.name));
+    const days = dates.map((date) => {
+      const d = new Date(`${date}T12:00:00.000Z`);
+      const w = mondayBasedWeekdayFromUtcDate(d);
+      const slots = memoryScheduleSlots.filter((s) => s.classId === classId && s.weekday === w);
+      const rows = students.map((st) => {
+        const coinsDay = memoryCoinTransactions
+          .filter((t) => t.studentId === st.id && t.classId === classId && t.type !== "reset" && getDayKey(t.createdAt) === date)
+          .reduce((s, t) => s + t.amount, 0);
+        const slotPresence = slots.map((slot) => {
+          const row = memoryLessonAttendance.find(
+            (a) => a.classId === classId && a.date === date && a.scheduleSlotId === slot.id && a.studentId === st.id
+          );
+          return { scheduleSlotId: slot.id, title: slot.title, startTime: slot.startTime, endTime: slot.endTime, present: row ? row.present : null };
+        });
+        return { studentId: st.id, studentName: st.name, coinsDay, slots: slotPresence };
+      });
+      return { date, slots, rows };
+    });
+    return res.json({ classId, from, to, days });
+  }
+
+  try {
+    const dates: string[] = [];
+    const cur = new Date(start);
+    while (cur <= end) {
+      dates.push(formatUtcYmd(cur));
+      cur.setUTCDate(cur.getUTCDate() + 1);
+    }
+    const studentsCol = await getStudentsCol();
+    const stList = await studentsCol.find({ classId: new ObjectId(classId) }).sort({ name: 1 }).toArray();
+    const students = stList.map((s) => ({ id: s._id!.toString(), name: s.name }));
+    const slotsCol = await getScheduleSlotsCol();
+    const allSlots = await slotsCol.find({ classId }).toArray();
+    const slotByWeekday = new Map<number, typeof allSlots>();
+    for (const s of allSlots) {
+      const w = s.weekday;
+      if (!slotByWeekday.has(w)) slotByWeekday.set(w, []);
+      slotByWeekday.get(w)!.push(s);
+    }
+    const attCol = await getLessonAttendanceCol();
+    const txCol = await getCoinTransactionsCol();
+    const days = [];
+    for (const date of dates) {
+      const d = new Date(`${date}T12:00:00.000Z`);
+      const w = mondayBasedWeekdayFromUtcDate(d);
+      const slotDocs = (slotByWeekday.get(w) ?? []).slice().sort((a, b) => a.startTime.localeCompare(b.startTime));
+      const slots = slotDocs.map((s) => ({
+        id: s._id!.toString(),
+        title: s.title || "",
+        startTime: s.startTime,
+        endTime: s.endTime,
+      }));
+      const attRows = await attCol.find({ classId, date }).toArray();
+      const attMap = new Map<string, Map<string, boolean>>();
+      for (const a of attRows) {
+        if (!attMap.has(a.studentId)) attMap.set(a.studentId, new Map());
+        attMap.get(a.studentId)!.set(a.scheduleSlotId, a.present);
+      }
+      const txList = await txCol
+        .find({
+          classId,
+          type: { $ne: "reset" },
+          createdAt: { $gte: `${date}T00:00:00.000Z`, $lte: `${date}T23:59:59.999Z` },
+        })
+        .toArray();
+      const coinsByStudent = new Map<string, number>();
+      for (const t of txList) {
+        coinsByStudent.set(t.studentId, (coinsByStudent.get(t.studentId) ?? 0) + t.amount);
+      }
+      const rows = students.map((st) => {
+        const sm = attMap.get(st.id);
+        const slotPresence = slots.map((slot) => ({
+          scheduleSlotId: slot.id,
+          title: slot.title,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          present: sm?.get(slot.id) ?? null,
+        }));
+        return {
+          studentId: st.id,
+          studentName: st.name,
+          coinsDay: coinsByStudent.get(st.id) ?? 0,
+          slots: slotPresence,
+        };
+      });
+      days.push({ date, slots, rows });
+    }
+    return res.json({ classId, from, to, days });
+  } catch (e) {
+    console.error("GET /api/admin/reports/range error:", e);
+    return res.status(500).json({ error: "Failed to build range report" });
   }
 });
 
