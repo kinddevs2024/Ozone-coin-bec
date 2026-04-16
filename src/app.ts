@@ -778,6 +778,80 @@ app.get("/api/classes", async (_req, res) => {
   }
 });
 
+function starsFromCoins(coins: number, maxCoins: number): number {
+  if (maxCoins <= 0) return 1;
+  const raw = Math.round((coins / maxCoins) * 4) + 1;
+  return Math.max(1, Math.min(5, raw));
+}
+
+app.get("/api/classes/:classId/ratings", async (req, res) => {
+  const classId = req.params.classId;
+  const pageRaw = Number(req.query.page);
+  const sizeRaw = Number(req.query.pageSize);
+  const page = Number.isFinite(pageRaw) && pageRaw >= 0 ? Math.floor(pageRaw) : 0;
+  const pageSize = Number.isFinite(sizeRaw) && sizeRaw >= 1 ? Math.min(50, Math.floor(sizeRaw)) : 10;
+
+  if (useMemoryStorage) {
+    const list = memoryStudents
+      .filter((s) => s.classId === classId)
+      .sort((a, b) => b.coins - a.coins || a.name.localeCompare(b.name));
+    const total = list.length;
+    const maxCoins = list[0]?.coins ?? 0;
+    const start = page * pageSize;
+    const slice = list.slice(start, start + pageSize);
+    const items = slice.map((s, i) => ({
+      id: s.id,
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+      rank: start + i + 1,
+    }));
+    return res.json({
+      classId,
+      total,
+      page,
+      pageSize,
+      maxCoins,
+      hasMore: start + slice.length < total,
+      items,
+    });
+  }
+
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(classId);
+  } catch {
+    return res.status(400).json({ error: "Invalid class id" });
+  }
+  try {
+    const col = await getStudentsCol();
+    const maxDoc = await col.find({ classId: oid }).sort({ coins: -1, name: 1 }).limit(1).toArray();
+    const maxCoins = maxDoc[0]?.coins ?? 0;
+    const total = await col.countDocuments({ classId: oid });
+    const start = page * pageSize;
+    const list = await col.find({ classId: oid }).sort({ coins: -1, name: 1 }).skip(start).limit(pageSize).toArray();
+    const items = list.map((s, i) => ({
+      id: s._id!.toString(),
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+      rank: start + i + 1,
+    }));
+    return res.json({
+      classId,
+      total,
+      page,
+      pageSize,
+      maxCoins,
+      hasMore: start + list.length < total,
+      items,
+    });
+  } catch (e) {
+    console.error("GET /api/classes/:classId/ratings error:", e);
+    return res.status(500).json({ error: "Failed to load ratings" });
+  }
+});
+
 app.get("/api/classes/:classId/students", async (req, res) => {
   const classId = req.params.classId;
   if (useMemoryStorage) {
