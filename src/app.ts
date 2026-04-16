@@ -65,12 +65,14 @@ const memoryAssignments: {
   reviewComment: string | null;
   awardedCoins: number | null;
 }[] = [];
+type CoinTxType = "admin_update" | "reset" | "assignment_reward" | "weekly_activity_bonus" | "monthly_rank_bonus";
+
 const memoryCoinTransactions: {
   id: string;
   studentId: string;
   classId: string;
   amount: number;
-  type: "admin_update" | "reset" | "assignment_reward";
+  type: CoinTxType;
   note: string;
   createdAt: string;
 }[] = [];
@@ -230,7 +232,7 @@ function getCoinTransactionsCol() {
       studentId: string;
       classId: string;
       amount: number;
-      type: "admin_update" | "reset" | "assignment_reward";
+      type: CoinTxType;
       note: string;
       createdAt: string;
     }>("coin_transactions")
@@ -350,6 +352,178 @@ function getMonthKey(iso: string): string {
 }
 function getDayKey(iso: string): string {
   return iso.slice(0, 10);
+}
+
+/** Dushanba 00:00 UTC — hafta kaliti sifatida YYYY-MM-DD */
+function utcMondayDate(d: Date): Date {
+  const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dow = x.getUTCDay();
+  const diff = dow === 0 ? -6 : 1 - dow;
+  x.setUTCDate(x.getUTCDate() + diff);
+  x.setUTCHours(0, 0, 0, 0);
+  return x;
+}
+
+function utcWeekBoundsFromTimestamp(iso: string): { start: string; end: string; weekKey: string } {
+  const d = new Date(iso);
+  const mon = utcMondayDate(d);
+  const sun = new Date(mon);
+  sun.setUTCDate(sun.getUTCDate() + 6);
+  sun.setUTCHours(23, 59, 59, 999);
+  return {
+    start: mon.toISOString(),
+    end: sun.toISOString(),
+    weekKey: formatUtcYmd(mon),
+  };
+}
+
+const WEEKLY_BONUS_EXCLUDED: ReadonlySet<CoinTxType> = new Set([
+  "reset",
+  "weekly_activity_bonus",
+  "monthly_rank_bonus",
+]);
+
+function weeklyActivityTargetBonus(qualifyingPositiveSum: number): number {
+  if (qualifyingPositiveSum >= 100) return 15;
+  if (qualifyingPositiveSum >= 75) return 10;
+  if (qualifyingPositiveSum >= 50) return 5;
+  return 0;
+}
+
+function computeWeeklyBonusDeltaMemory(studentId: string, classId: string, referenceIso: string): number {
+  const { start, end, weekKey } = utcWeekBoundsFromTimestamp(referenceIso);
+  let qualifying = 0;
+  let already = 0;
+  for (const t of memoryCoinTransactions) {
+    if (t.studentId !== studentId || t.classId !== classId) continue;
+    if (t.createdAt < start || t.createdAt > end) continue;
+    if (t.type === "weekly_activity_bonus") {
+      already += t.amount;
+      continue;
+    }
+    if (WEEKLY_BONUS_EXCLUDED.has(t.type)) continue;
+    if (t.amount > 0) qualifying += t.amount;
+  }
+  const target = weeklyActivityTargetBonus(qualifying);
+  return Math.max(0, target - already);
+}
+
+async function computeWeeklyBonusDeltaMongo(studentId: string, classId: string, referenceIso: string): Promise<number> {
+  const { start, end } = utcWeekBoundsFromTimestamp(referenceIso);
+  const txCol = await getCoinTransactionsCol();
+  const txs = await txCol
+    .find({
+      studentId,
+      classId,
+      createdAt: { $gte: start, $lte: end },
+    })
+    .toArray();
+  let qualifying = 0;
+  let already = 0;
+  for (const t of txs) {
+    const ty = t.type as CoinTxType;
+    if (ty === "weekly_activity_bonus") {
+      already += t.amount;
+      continue;
+    }
+    if (WEEKLY_BONUS_EXCLUDED.has(ty)) continue;
+    if (t.amount > 0) qualifying += t.amount;
+  }
+  const target = weeklyActivityTargetBonus(qualifying);
+  return Math.max(0, target - already);
+}
+
+function applyWeeklyActivityBonusMemory(studentId: string, classId: string) {
+  const nowIso = new Date().toISOString();
+  for (let hop = 0; hop < 5; hop++) {
+    const delta = computeWeeklyBonusDeltaMemory(studentId, classId, nowIso);
+    if (delta <= 0) break;
+    const s = memoryStudents.find((x) => x.id === studentId);
+    if (!s) break;
+    const { weekKey } = utcWeekBoundsFromTimestamp(nowIso);
+    s.coins += delta;
+    memoryCoinTransactions.push({
+      id: new ObjectId().toString(),
+      studentId,
+      classId,
+      amount: delta,
+      type: "weekly_activity_bonus",
+      note: `Haftalik faollik bonusi (${weekKey} haftasi, jami stavka bo'yicha +${delta})`,
+      createdAt: nowIso,
+    });
+    ensureMemoryAutoResetTracking(classId, nowIso);
+  }
+}
+
+async function applyWeeklyActivityBonusMongo(studentId: string, classId: string) {
+  const nowIso = new Date().toISOString();
+  for (let hop = 0; hop < 5; hop++) {
+    const delta = await computeWeeklyBonusDeltaMongo(studentId, classId, nowIso);
+    if (delta <= 0) break;
+    const studentsCol = await getStudentsCol();
+    const updated = await studentsCol.findOneAndUpdate(
+      { _id: new ObjectId(studentId) },
+      { $inc: { coins: delta } },
+      { returnDocument: "after" }
+    );
+    if (!updated) break;
+    const { weekKey } = utcWeekBoundsFromTimestamp(nowIso);
+    const txCol = await getCoinTransactionsCol();
+    await txCol.insertOne({
+      studentId,
+      classId,
+      amount: delta,
+      type: "weekly_activity_bonus",
+      note: `Haftalik faollik bonusi (${weekKey} haftasi, jami stavka bo'yicha +${delta})`,
+      createdAt: nowIso,
+    });
+    await ensureMongoAutoResetTracking(classId, nowIso);
+  }
+}
+
+type RankRow = { id: string; name: string; coins: number };
+
+const MONTHLY_RANK_AMOUNTS = [30, 20, 10] as const;
+
+function grantMonthlyRankBonusesMemory(classId: string, ranked: RankRow[], resetAt: string) {
+  const sorted = ranked.slice().sort((a, b) => b.coins - a.coins || a.name.localeCompare(b.name));
+  for (let i = 0; i < 3 && i < sorted.length; i++) {
+    const row = sorted[i]!;
+    const amount = MONTHLY_RANK_AMOUNTS[i];
+    if (amount <= 0) continue;
+    const s = memoryStudents.find((x) => x.id === row.id);
+    if (!s) continue;
+    s.coins += amount;
+    memoryCoinTransactions.push({
+      id: new ObjectId().toString(),
+      studentId: row.id,
+      classId,
+      amount,
+      type: "monthly_rank_bonus",
+      note: `Oy yakuni: sinf bo'yicha ${i + 1}-o'rin — keyingi davr boshlang'ich +${amount} coin`,
+      createdAt: resetAt,
+    });
+  }
+}
+
+async function grantMonthlyRankBonusesMongo(classId: string, ranked: RankRow[], resetAt: string) {
+  const sorted = ranked.slice().sort((a, b) => b.coins - a.coins || a.name.localeCompare(b.name));
+  const studentsCol = await getStudentsCol();
+  const txCol = await getCoinTransactionsCol();
+  for (let i = 0; i < 3 && i < sorted.length; i++) {
+    const row = sorted[i]!;
+    const amount = MONTHLY_RANK_AMOUNTS[i];
+    if (amount <= 0) continue;
+    await studentsCol.updateOne({ _id: new ObjectId(row.id) }, { $inc: { coins: amount } });
+    await txCol.insertOne({
+      studentId: row.id,
+      classId,
+      amount,
+      type: "monthly_rank_bonus",
+      note: `Oy yakuni: sinf bo'yicha ${i + 1}-o'rin — keyingi davr boshlang'ich +${amount} coin`,
+      createdAt: resetAt,
+    });
+  }
 }
 
 function utcMondayFromWeekStartParam(weekStart?: string): Date {
@@ -1160,6 +1334,10 @@ app.patch("/api/admin/assignments/:id/review", requireAdmin, async (req, res) =>
   const reviewComment = typeof req.body?.reviewComment === "string" ? req.body.reviewComment.trim() : "";
   const awardedCoins = coerceNonNegativeInt(req.body?.awardedCoins);
   const reviewedAt = new Date().toISOString();
+  const HOMEWORK_REWARD_MAX = 10;
+  if (awardedCoins > HOMEWORK_REWARD_MAX) {
+    return res.status(400).json({ error: `Uy vazifasi mukofoti: maksimal ${HOMEWORK_REWARD_MAX} coin (10 ballik shkala)` });
+  }
 
   if (useMemoryStorage) {
     const a = memoryAssignments.find((x) => x.id === id);
@@ -1183,6 +1361,7 @@ app.patch("/api/admin/assignments/:id/review", requireAdmin, async (req, res) =>
         createdAt: reviewedAt,
       });
       ensureMemoryAutoResetTracking(student.classId, reviewedAt);
+      applyWeeklyActivityBonusMemory(student.id, student.classId);
     }
     return res.json({ ok: true, assignment: a });
   }
@@ -1218,6 +1397,7 @@ app.patch("/api/admin/assignments/:id/review", requireAdmin, async (req, res) =>
         createdAt: reviewedAt,
       });
       await ensureMongoAutoResetTracking(student.classId.toString(), reviewedAt);
+      await applyWeeklyActivityBonusMongo(updated.studentId, String(updated.classId));
     }
     return res.json({ ok: true, assignment: { id: updated._id?.toString(), ...updated } });
   } catch (e) {
@@ -1910,7 +2090,8 @@ app.post("/api/classes/:classId/reset-coins", requireAdmin, async (req, res) => 
     const cls = memoryClasses.find((c) => c.id === classId);
     if (!cls) return res.status(404).json({ error: "Class not found" });
     const classStudents = memoryStudents.filter((s) => s.classId === classId);
-    const studentsBefore = classStudents.map((s) => ({ name: s.name, coins: s.coins }));
+    const ranked: RankRow[] = classStudents.map((s) => ({ id: s.id, name: s.name, coins: s.coins }));
+    const studentsBefore = ranked.map((r) => ({ name: r.name, coins: r.coins }));
     const resetAt = new Date().toISOString();
     for (const s of classStudents) {
       if (s.coins !== 0) {
@@ -1926,6 +2107,7 @@ app.post("/api/classes/:classId/reset-coins", requireAdmin, async (req, res) => 
       }
       s.coins = 0;
     }
+    grantMonthlyRankBonusesMemory(classId, ranked, resetAt);
     const entry = {
       id: new ObjectId().toString(),
       classId,
@@ -1951,7 +2133,12 @@ app.post("/api/classes/:classId/reset-coins", requireAdmin, async (req, res) => 
 
     const studentsCol = await getStudentsCol();
     const studentsList = await studentsCol.find({ classId: classOid }).toArray();
-    const studentsBefore = studentsList.map((s) => ({ name: s.name, coins: s.coins }));
+    const ranked: RankRow[] = studentsList.map((s) => ({
+      id: s._id!.toString(),
+      name: s.name,
+      coins: s.coins,
+    }));
+    const studentsBefore = ranked.map((r) => ({ name: r.name, coins: r.coins }));
 
     await studentsCol.updateMany({ classId: classOid }, { $set: { coins: 0 } });
     const txCol = await getCoinTransactionsCol();
@@ -1968,6 +2155,8 @@ app.post("/api/classes/:classId/reset-coins", requireAdmin, async (req, res) => 
         });
       }
     }
+
+    await grantMonthlyRankBonusesMongo(classId, ranked, resetAt);
 
     const analyticsEntry = {
       classId,
@@ -2128,6 +2317,7 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
     });
     if (num > 0) {
       ensureMemoryAutoResetTracking(s.classId, new Date().toISOString());
+      applyWeeklyActivityBonusMemory(s.id, s.classId);
     }
     return res.json({ id: s.id, name: s.name, coins: s.coins, class_id: s.classId });
   }
@@ -2152,6 +2342,7 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
 
     if (num > 0) {
       await ensureMongoAutoResetTracking(updated.classId.toString(), new Date().toISOString());
+      await applyWeeklyActivityBonusMongo(updated._id!.toString(), updated.classId.toString());
     }
 
     res.json({
@@ -2178,7 +2369,8 @@ async function checkAutoResets() {
         const cls = memoryClasses.find((c) => c.id === ar.classId);
         if (!cls) continue;
         const classStudents = memoryStudents.filter((s) => s.classId === ar.classId);
-        const studentsBefore = classStudents.map((s) => ({ name: s.name, coins: s.coins }));
+        const ranked: RankRow[] = classStudents.map((s) => ({ id: s.id, name: s.name, coins: s.coins }));
+        const studentsBefore = ranked.map((r) => ({ name: r.name, coins: r.coins }));
         const resetAt = new Date().toISOString();
         for (const s of classStudents) {
           if (s.coins !== 0) {
@@ -2194,6 +2386,7 @@ async function checkAutoResets() {
           }
           s.coins = 0;
         }
+        grantMonthlyRankBonusesMemory(ar.classId, ranked, resetAt);
         memoryAnalytics.push({
           id: new ObjectId().toString(),
           classId: ar.classId,
@@ -2224,7 +2417,12 @@ async function checkAutoResets() {
 
         const studentsCol = await getStudentsCol();
         const studentsList = await studentsCol.find({ classId: classOid }).toArray();
-        const studentsBefore = studentsList.map((s) => ({ name: s.name, coins: s.coins }));
+        const ranked: RankRow[] = studentsList.map((s) => ({
+          id: s._id!.toString(),
+          name: s.name,
+          coins: s.coins,
+        }));
+        const studentsBefore = ranked.map((r) => ({ name: r.name, coins: r.coins }));
 
         await studentsCol.updateMany({ classId: classOid }, { $set: { coins: 0 } });
 
@@ -2242,6 +2440,7 @@ async function checkAutoResets() {
             });
           }
         }
+        await grantMonthlyRankBonusesMongo(tracking.classId, ranked, resetAt);
         const analyticsCol = await getAnalyticsCol();
         await analyticsCol.insertOne({
           classId: tracking.classId,
