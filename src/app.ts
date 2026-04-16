@@ -63,13 +63,14 @@ const memoryAssignments: {
   answeredAt: string | null;
   reviewedAt: string | null;
   reviewComment: string | null;
+  awardedCoins: number | null;
 }[] = [];
 const memoryCoinTransactions: {
   id: string;
   studentId: string;
   classId: string;
   amount: number;
-  type: "admin_update" | "reset";
+  type: "admin_update" | "reset" | "assignment_reward";
   note: string;
   createdAt: string;
 }[] = [];
@@ -200,6 +201,7 @@ function getAssignmentsCol() {
       answeredAt: string | null;
       reviewedAt: string | null;
       reviewComment: string | null;
+      awardedCoins?: number | null;
     }>("assignments")
   );
 }
@@ -210,7 +212,7 @@ function getCoinTransactionsCol() {
       studentId: string;
       classId: string;
       amount: number;
-      type: "admin_update" | "reset";
+      type: "admin_update" | "reset" | "assignment_reward";
       note: string;
       createdAt: string;
     }>("coin_transactions")
@@ -302,6 +304,218 @@ function hashPassword(raw: string): string {
 }
 function getMonthKey(iso: string): string {
   return iso.slice(0, 7);
+}
+function getDayKey(iso: string): string {
+  return iso.slice(0, 10);
+}
+function normalizeClassName(name: string): string {
+  return name.replace(/\s+/g, "").trim().toUpperCase();
+}
+function normalizeStudentName(name: string): string {
+  return name.replace(/\s+/g, " ").trim().toLowerCase();
+}
+function coerceNonNegativeInt(value: unknown): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return 0;
+  return Math.floor(num);
+}
+function createDateRange(fromIso: string, toIso: string, mode: "day" | "month"): string[] {
+  const out: string[] = [];
+  const start = new Date(fromIso);
+  const end = new Date(toIso);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return out;
+
+  if (mode === "month") {
+    const current = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1));
+    const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1));
+    while (current <= last) {
+      out.push(`${current.getUTCFullYear()}-${String(current.getUTCMonth() + 1).padStart(2, "0")}`);
+      current.setUTCMonth(current.getUTCMonth() + 1);
+    }
+    return out;
+  }
+
+  const current = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+  while (current <= last) {
+    out.push(current.toISOString().slice(0, 10));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  return out;
+}
+
+function ensureMemoryAutoResetTracking(classId: string, createdAt: string) {
+  const existing = memoryAutoReset.find((a) => a.classId === classId);
+  if (!existing) {
+    memoryAutoReset.push({
+      id: new ObjectId().toString(),
+      classId,
+      firstCoinAt: createdAt,
+      lastResetAt: null,
+    });
+  }
+}
+
+async function ensureMongoAutoResetTracking(classId: string, createdAt: string) {
+  const autoResetCol = await getAutoResetCol();
+  const existing = await autoResetCol.findOne({ classId });
+  if (!existing) {
+    await autoResetCol.insertOne({
+      classId,
+      firstCoinAt: createdAt,
+      lastResetAt: null,
+    });
+  }
+}
+
+function createMemoryStudent(classId: string, name: string) {
+  const trimmedName = String(name).trim();
+  const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
+  let email = baseEmail;
+  while (memoryStudents.some((s) => s.email.toLowerCase() === email.toLowerCase())) {
+    email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
+  }
+  const tempPassword = randomTempPassword();
+  const id = new ObjectId().toString();
+  const entry = {
+    id,
+    name: trimmedName,
+    coins: 0,
+    classId,
+    email,
+    phone: null,
+    passwordHash: hashPassword(tempPassword),
+    mustChangePassword: true,
+    initialPassword: tempPassword,
+  };
+  memoryStudents.push(entry);
+  return {
+    id,
+    name: entry.name,
+    class_id: classId,
+    coins: 0,
+    email: entry.email,
+    mustChangePassword: true,
+    initialPassword: tempPassword,
+  };
+}
+
+async function createMongoStudent(classId: string, name: string) {
+  const trimmedName = String(name).trim();
+  const cid = new ObjectId(classId);
+  const col = await getStudentsCol();
+  const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
+  let email = baseEmail;
+  while (await col.findOne({ email })) {
+    email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
+  }
+  const tempPassword = randomTempPassword();
+  const result = await col.insertOne({
+    name: trimmedName,
+    classId: cid,
+    coins: 0,
+    email,
+    phone: null,
+    passwordHash: hashPassword(tempPassword),
+    mustChangePassword: true,
+    initialPassword: tempPassword,
+  });
+  return {
+    id: result.insertedId.toString(),
+    name: trimmedName,
+    class_id: classId,
+    coins: 0,
+    email,
+    mustChangePassword: true,
+    initialPassword: tempPassword,
+  };
+}
+
+function ensureMemoryClass(className: string) {
+  const normalized = normalizeClassName(className);
+  const existing = memoryClasses.find((cls) => normalizeClassName(cls.name) === normalized);
+  if (existing) return existing;
+  const created = { id: new ObjectId().toString(), name: normalized };
+  memoryClasses.push(created);
+  return created;
+}
+
+async function ensureMongoClass(className: string) {
+  const normalized = normalizeClassName(className);
+  const classesCol = await getClassesCol();
+  const existing = await classesCol.findOne({ name: normalized });
+  if (existing?._id) return { id: existing._id.toString(), name: existing.name };
+  const result = await classesCol.insertOne({ name: normalized });
+  return { id: result.insertedId.toString(), name: normalized };
+}
+
+function buildCoinStatsResponse(args: {
+  mode: "day" | "month" | "custom";
+  from: string | null;
+  to: string | null;
+  transactions: { studentId: string; classId: string; amount: number; createdAt: string }[];
+  students: { id: string; name: string; classId: string }[];
+  classes: { id: string; name: string }[];
+}) {
+  const { mode, from, to, transactions, students, classes } = args;
+  const bucketMode = mode === "month" ? "month" : "day";
+  const txList = transactions.filter((tx) => tx.amount !== 0);
+  const classMap = new Map(classes.map((cls) => [cls.id, cls.name]));
+  const studentMap = new Map(
+    students.map((student) => [
+      student.id,
+      {
+        studentId: student.id,
+        studentName: student.name,
+        classId: student.classId,
+        className: classMap.get(student.classId) ?? "Unknown",
+        total: 0,
+        values: {} as Record<string, number>,
+      },
+    ])
+  );
+
+  let columns: string[] = [];
+  if (from && to) {
+    columns = createDateRange(from, to, bucketMode);
+  } else {
+    const keys = new Set<string>();
+    for (const tx of txList) {
+      keys.add(bucketMode === "month" ? getMonthKey(tx.createdAt) : getDayKey(tx.createdAt));
+    }
+    columns = [...keys].sort();
+  }
+
+  for (const tx of txList) {
+    const row = studentMap.get(tx.studentId);
+    if (!row) continue;
+    const key = bucketMode === "month" ? getMonthKey(tx.createdAt) : getDayKey(tx.createdAt);
+    if (!columns.includes(key)) continue;
+    row.values[key] = (row.values[key] ?? 0) + tx.amount;
+    row.total += tx.amount;
+  }
+
+  const rows = [...studentMap.values()].filter((row) => row.total !== 0 || columns.some((column) => (row.values[column] ?? 0) !== 0));
+  rows.sort((a, b) => a.className.localeCompare(b.className) || a.studentName.localeCompare(b.studentName));
+
+  const grouped = new Map<string, { classId: string; className: string; rows: typeof rows }>();
+  for (const row of rows) {
+    const existing = grouped.get(row.classId);
+    if (existing) {
+      existing.rows.push(row);
+    } else {
+      grouped.set(row.classId, { classId: row.classId, className: row.className, rows: [row] });
+    }
+  }
+
+  return {
+    mode,
+    from,
+    to,
+    columns,
+    overall: rows,
+    classes: [...grouped.values()].sort((a, b) => a.className.localeCompare(b.className)),
+  };
 }
 
 const app = express();
@@ -650,6 +864,7 @@ app.post("/api/student/assignments/:id/answer", requireStudent, async (req, res)
     a.answeredAt = answeredAt;
     a.reviewedAt = null;
     a.reviewComment = null;
+    a.awardedCoins = null;
     return res.json({ ok: true, assignment: a });
   }
   try {
@@ -664,6 +879,7 @@ app.post("/api/student/assignments/:id/answer", requireStudent, async (req, res)
           answeredAt,
           reviewedAt: null,
           reviewComment: null,
+          awardedCoins: null,
         },
       },
       { returnDocument: "after" }
@@ -746,6 +962,7 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
       answeredAt: null,
       reviewedAt: null,
       reviewComment: null,
+      awardedCoins: null,
     };
     memoryAssignments.push(assignment);
     return res.json(assignment);
@@ -771,6 +988,7 @@ app.post("/api/assignments", requireAdmin, async (req, res) => {
       answeredAt: null,
       reviewedAt: null,
       reviewComment: null,
+      awardedCoins: null,
     };
     const result = await col.insertOne(doc);
     return res.json({ id: result.insertedId.toString(), ...doc });
@@ -817,6 +1035,7 @@ app.post("/api/assignments/class", requireAdmin, async (req, res) => {
         answeredAt: null,
         reviewedAt: null,
         reviewComment: null,
+        awardedCoins: null,
       };
       memoryAssignments.push(assignment);
       return assignment.id;
@@ -843,6 +1062,7 @@ app.post("/api/assignments/class", requireAdmin, async (req, res) => {
       answeredAt: null,
       reviewedAt: null,
       reviewComment: null,
+      awardedCoins: null,
     }));
     const col = await getAssignmentsCol();
     const result = await col.insertMany(docs);
@@ -896,24 +1116,67 @@ app.get("/api/admin/assignments", requireAdmin, async (_req, res) => {
 app.patch("/api/admin/assignments/:id/review", requireAdmin, async (req, res) => {
   const id = req.params.id;
   const reviewComment = typeof req.body?.reviewComment === "string" ? req.body.reviewComment.trim() : "";
+  const awardedCoins = coerceNonNegativeInt(req.body?.awardedCoins);
   const reviewedAt = new Date().toISOString();
 
   if (useMemoryStorage) {
     const a = memoryAssignments.find((x) => x.id === id);
     if (!a) return res.status(404).json({ error: "Assignment not found" });
+    if (!a.answeredAt) return res.status(400).json({ error: "Assignment has no answer yet" });
+    if (a.reviewedAt) return res.status(400).json({ error: "Assignment already reviewed" });
     a.reviewedAt = reviewedAt;
     a.reviewComment = reviewComment || null;
+    a.awardedCoins = awardedCoins;
+    if (awardedCoins > 0) {
+      const student = memoryStudents.find((s) => s.id === a.studentId);
+      if (!student) return res.status(404).json({ error: "Student not found" });
+      student.coins += awardedCoins;
+      memoryCoinTransactions.push({
+        id: new ObjectId().toString(),
+        studentId: student.id,
+        classId: student.classId,
+        amount: awardedCoins,
+        type: "assignment_reward",
+        note: `Assignment reward: ${a.title}`,
+        createdAt: reviewedAt,
+      });
+      ensureMemoryAutoResetTracking(student.classId, reviewedAt);
+    }
     return res.json({ ok: true, assignment: a });
   }
 
   try {
     const col = await getAssignmentsCol();
+    const existing = await col.findOne({ _id: new ObjectId(id) });
+    if (!existing) return res.status(404).json({ error: "Assignment not found" });
+    if (!existing.answeredAt) return res.status(400).json({ error: "Assignment has no answer yet" });
+    if (existing.reviewedAt) return res.status(400).json({ error: "Assignment already reviewed" });
+
     const updated = await col.findOneAndUpdate(
       { _id: new ObjectId(id) },
-      { $set: { reviewedAt, reviewComment: reviewComment || null } },
+      { $set: { reviewedAt, reviewComment: reviewComment || null, awardedCoins } },
       { returnDocument: "after" }
     );
     if (!updated) return res.status(404).json({ error: "Assignment not found" });
+    if (awardedCoins > 0) {
+      const studentsCol = await getStudentsCol();
+      const student = await studentsCol.findOneAndUpdate(
+        { _id: new ObjectId(updated.studentId) },
+        { $inc: { coins: awardedCoins } },
+        { returnDocument: "after" }
+      );
+      if (!student) return res.status(404).json({ error: "Student not found" });
+      const txCol = await getCoinTransactionsCol();
+      await txCol.insertOne({
+        studentId: updated.studentId,
+        classId: updated.classId,
+        amount: awardedCoins,
+        type: "assignment_reward",
+        note: `Assignment reward: ${updated.title}`,
+        createdAt: reviewedAt,
+      });
+      await ensureMongoAutoResetTracking(student.classId.toString(), reviewedAt);
+    }
     return res.json({ ok: true, assignment: { id: updated._id?.toString(), ...updated } });
   } catch (e) {
     console.error("PATCH /api/admin/assignments/:id/review error:", e);
@@ -1046,6 +1309,88 @@ app.get("/api/analytics", async (_req, res) => {
   } catch (e) {
     console.error("GET /api/analytics error:", e);
     return res.status(200).json([]);
+  }
+});
+
+app.get("/api/coin-stats", async (req, res) => {
+  const rawMode = typeof req.query.mode === "string" ? req.query.mode : "day";
+  const mode: "day" | "month" | "custom" =
+    rawMode === "month" || rawMode === "custom" ? rawMode : "day";
+  const from = typeof req.query.from === "string" && req.query.from.trim() ? req.query.from.trim() : null;
+  const to = typeof req.query.to === "string" && req.query.to.trim() ? req.query.to.trim() : null;
+  const hasCustomRange = mode === "custom" && from && to;
+  const fromBoundary = hasCustomRange ? new Date(`${from}T00:00:00.000Z`) : null;
+  const toBoundary = hasCustomRange ? new Date(`${to}T23:59:59.999Z`) : null;
+
+  if (mode === "custom") {
+    if (!from || !to || !fromBoundary || !toBoundary || Number.isNaN(fromBoundary.getTime()) || Number.isNaN(toBoundary.getTime()) || fromBoundary > toBoundary) {
+      return res.status(400).json({ error: "Valid from and to are required for custom mode" });
+    }
+  }
+
+  const filterTx = (tx: { type: string; createdAt: string }) => {
+    if (tx.type === "reset") return false;
+    if (!hasCustomRange || !fromBoundary || !toBoundary) return true;
+    const createdAt = new Date(tx.createdAt);
+    return createdAt >= fromBoundary && createdAt <= toBoundary;
+  };
+
+  if (useMemoryStorage) {
+    const transactions = memoryCoinTransactions
+      .filter(filterTx)
+      .map((tx) => ({
+        studentId: tx.studentId,
+        classId: tx.classId,
+        amount: tx.amount,
+        createdAt: tx.createdAt,
+      }));
+    return res.json(
+      buildCoinStatsResponse({
+        mode,
+        from,
+        to,
+        transactions,
+        students: memoryStudents.map((student) => ({ id: student.id, name: student.name, classId: student.classId })),
+        classes: memoryClasses.map((cls) => ({ id: cls.id, name: cls.name })),
+      })
+    );
+  }
+
+  try {
+    const txCol = await getCoinTransactionsCol();
+    const query: Record<string, unknown> = { type: { $ne: "reset" } };
+    if (hasCustomRange && fromBoundary && toBoundary) {
+      query.createdAt = { $gte: fromBoundary.toISOString(), $lte: toBoundary.toISOString() };
+    }
+
+    const [transactions, students, classes] = await Promise.all([
+      txCol.find(query).toArray(),
+      getStudentsCol().then((col) => col.find({}).toArray()),
+      getClassesCol().then((col) => col.find({}).toArray()),
+    ]);
+
+    return res.json(
+      buildCoinStatsResponse({
+        mode,
+        from,
+        to,
+        transactions: transactions.map((tx) => ({
+          studentId: tx.studentId,
+          classId: tx.classId,
+          amount: tx.amount,
+          createdAt: tx.createdAt,
+        })),
+        students: students.map((student) => ({
+          id: student._id!.toString(),
+          name: student.name,
+          classId: student.classId.toString(),
+        })),
+        classes: classes.map((cls) => ({ id: cls._id!.toString(), name: cls.name })),
+      })
+    );
+  } catch (e) {
+    console.error("GET /api/coin-stats error:", e);
+    return res.status(500).json({ error: "Failed to get coin stats" });
   }
 });
 
@@ -1190,71 +1535,103 @@ app.post("/api/students", requireAdmin, async (req, res) => {
   if (useMemoryStorage) {
     const exists = memoryClasses.some((c) => c.id === cidStr);
     if (!exists) return res.status(400).json({ error: "Invalid classId" });
-    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
-    let email = baseEmail;
-    while (memoryStudents.some((s) => s.email.toLowerCase() === email.toLowerCase())) {
-      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
-    }
-    const tempPassword = randomTempPassword();
-    const id = new ObjectId().toString();
-    const entry = {
-      id,
-      name: trimmedName,
-      coins: 0,
-      classId: cidStr,
-      email,
-      phone: null,
-      passwordHash: hashPassword(tempPassword),
-      mustChangePassword: true,
-      initialPassword: tempPassword,
-    };
-    memoryStudents.push(entry);
-    return res.json({
-      id,
-      name: entry.name,
-      class_id: cidStr,
-      coins: 0,
-      email: entry.email,
-      mustChangePassword: true,
-      initialPassword: tempPassword,
-    });
-  }
-  let cid: ObjectId;
-  try {
-    cid = new ObjectId(classId);
-  } catch {
-    return res.status(400).json({ error: "Invalid classId" });
+    return res.json(createMemoryStudent(cidStr, trimmedName));
   }
   try {
-    const col = await getStudentsCol();
-    const baseEmail = `${slugifyName(trimmedName)}@ozonecoin.uz`;
-    let email = baseEmail;
-    while (await col.findOne({ email })) {
-      email = `${slugifyName(trimmedName)}${randomSuffix()}@ozonecoin.uz`;
-    }
-    const tempPassword = randomTempPassword();
-    const result = await col.insertOne({
-      name: trimmedName,
-      classId: cid,
-      coins: 0,
-      email,
-      phone: null,
-      passwordHash: hashPassword(tempPassword),
-      mustChangePassword: true,
-      initialPassword: tempPassword,
-    });
-    res.json({
-      id: result.insertedId.toString(),
-      name: trimmedName,
-      class_id: classId,
-      coins: 0,
-      email,
-      mustChangePassword: true,
-      initialPassword: tempPassword,
-    });
+    const cid = new ObjectId(classId);
+    const classesCol = await getClassesCol();
+    const exists = await classesCol.findOne({ _id: cid });
+    if (!exists) return res.status(400).json({ error: "Invalid classId" });
+    res.json(await createMongoStudent(classId, trimmedName));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to add student" });
+  }
+});
+
+app.post("/api/admin/import-students", requireAdmin, async (req, res) => {
+  const rawStudents = Array.isArray(req.body?.students) ? req.body.students : [];
+  const normalizedInput = rawStudents
+    .map((item: unknown) => {
+      const record = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+      return {
+        name: typeof record.name === "string" ? record.name.trim() : "",
+        className: typeof record.className === "string" ? normalizeClassName(record.className) : "",
+      };
+    })
+    .filter((item: { name: string; className: string }) => item.name && item.className);
+
+  if (normalizedInput.length === 0) {
+    return res.status(400).json({ error: "students are required" });
+  }
+
+  if (useMemoryStorage) {
+    const created: Array<{ id: string; name: string; className: string; email: string; initialPassword: string }> = [];
+    const skipped: Array<{ name: string; className: string; reason: string }> = [];
+
+    for (const item of normalizedInput) {
+      const cls = ensureMemoryClass(item.className);
+      const exists = memoryStudents.some(
+        (student) =>
+          student.classId === cls.id && normalizeStudentName(student.name) === normalizeStudentName(item.name)
+      );
+      if (exists) {
+        skipped.push({ ...item, reason: "Student already exists in this class" });
+        continue;
+      }
+      const createdStudent = createMemoryStudent(cls.id, item.name);
+      created.push({
+        id: createdStudent.id,
+        name: createdStudent.name,
+        className: cls.name,
+        email: createdStudent.email!,
+        initialPassword: createdStudent.initialPassword!,
+      });
+    }
+
+    return res.json({ created, skipped });
+  }
+
+  try {
+    const classesCol = await getClassesCol();
+    const studentsCol = await getStudentsCol();
+    const existingClasses = await classesCol.find({}).toArray();
+    const classMap = new Map(existingClasses.map((cls) => [normalizeClassName(cls.name), { id: cls._id!.toString(), name: cls.name }]));
+    const existingStudents = await studentsCol.find({}).toArray();
+    const existingStudentKeys = new Set(
+      existingStudents.map((student) => `${student.classId.toString()}::${normalizeStudentName(student.name)}`)
+    );
+
+    const created: Array<{ id: string; name: string; className: string; email: string; initialPassword: string }> = [];
+    const skipped: Array<{ name: string; className: string; reason: string }> = [];
+
+    for (const item of normalizedInput) {
+      let cls = classMap.get(item.className);
+      if (!cls) {
+        cls = await ensureMongoClass(item.className);
+        classMap.set(item.className, cls);
+      }
+      const dedupeKey = `${cls.id}::${normalizeStudentName(item.name)}`;
+      if (existingStudentKeys.has(dedupeKey)) {
+        skipped.push({ ...item, reason: "Student already exists in this class" });
+        continue;
+      }
+
+      const createdStudent = await createMongoStudent(cls.id, item.name);
+      existingStudentKeys.add(dedupeKey);
+      created.push({
+        id: createdStudent.id,
+        name: createdStudent.name,
+        className: cls.name,
+        email: createdStudent.email!,
+        initialPassword: createdStudent.initialPassword!,
+      });
+    }
+
+    return res.json({ created, skipped });
+  } catch (e) {
+    console.error("POST /api/admin/import-students error:", e);
+    return res.status(500).json({ error: "Failed to import students" });
   }
 });
 
@@ -1297,15 +1674,7 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
       createdAt: new Date().toISOString(),
     });
     if (num > 0) {
-      const existing = memoryAutoReset.find((a) => a.classId === s.classId);
-      if (!existing) {
-        memoryAutoReset.push({
-          id: new ObjectId().toString(),
-          classId: s.classId,
-          firstCoinAt: new Date().toISOString(),
-          lastResetAt: null,
-        });
-      }
+      ensureMemoryAutoResetTracking(s.classId, new Date().toISOString());
     }
     return res.json({ id: s.id, name: s.name, coins: s.coins, class_id: s.classId });
   }
@@ -1329,16 +1698,7 @@ app.patch("/api/students/:id/coins", requireAdmin, async (req, res) => {
     });
 
     if (num > 0) {
-      const autoResetCol = await getAutoResetCol();
-      const classId = updated.classId.toString();
-      const existing = await autoResetCol.findOne({ classId });
-      if (!existing) {
-        await autoResetCol.insertOne({
-          classId,
-          firstCoinAt: new Date().toISOString(),
-          lastResetAt: null,
-        });
-      }
+      await ensureMongoAutoResetTracking(updated.classId.toString(), new Date().toISOString());
     }
 
     res.json({
