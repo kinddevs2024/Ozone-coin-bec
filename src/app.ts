@@ -308,12 +308,6 @@ function getMonthKey(iso: string): string {
 function getDayKey(iso: string): string {
   return iso.slice(0, 10);
 }
-function normalizeClassName(name: string): string {
-  return name.replace(/\s+/g, "").trim().toUpperCase();
-}
-function normalizeStudentName(name: string): string {
-  return name.replace(/\s+/g, " ").trim().toLowerCase();
-}
 function coerceNonNegativeInt(value: unknown): number {
   const num = Number(value);
   if (!Number.isFinite(num) || num < 0) return 0;
@@ -429,24 +423,6 @@ async function createMongoStudent(classId: string, name: string) {
     mustChangePassword: true,
     initialPassword: tempPassword,
   };
-}
-
-function ensureMemoryClass(className: string) {
-  const normalized = normalizeClassName(className);
-  const existing = memoryClasses.find((cls) => normalizeClassName(cls.name) === normalized);
-  if (existing) return existing;
-  const created = { id: new ObjectId().toString(), name: normalized };
-  memoryClasses.push(created);
-  return created;
-}
-
-async function ensureMongoClass(className: string) {
-  const normalized = normalizeClassName(className);
-  const classesCol = await getClassesCol();
-  const existing = await classesCol.findOne({ name: normalized });
-  if (existing?._id) return { id: existing._id.toString(), name: existing.name };
-  const result = await classesCol.insertOne({ name: normalized });
-  return { id: result.insertedId.toString(), name: normalized };
 }
 
 function buildCoinStatsResponse(args: {
@@ -1502,6 +1478,36 @@ app.post("/api/classes", requireAdmin, async (req, res) => {
   }
 });
 
+app.patch("/api/classes/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { name } = req.body || {};
+  if (!name || typeof name !== "string") return res.status(400).json({ error: "Name required" });
+  const trimmed = name.trim();
+  if (!trimmed) return res.status(400).json({ error: "Name required" });
+
+  if (useMemoryStorage) {
+    const existing = memoryClasses.find((c) => c.id === id);
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    existing.name = trimmed;
+    return res.json({ id: existing.id, name: existing.name });
+  }
+
+  try {
+    const oid = new ObjectId(id);
+    const classesCol = await getClassesCol();
+    const updated = await classesCol.findOneAndUpdate(
+      { _id: oid },
+      { $set: { name: trimmed } },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(404).json({ error: "Not found" });
+    return res.json({ id: updated._id!.toString(), name: updated.name });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to update class" });
+  }
+});
+
 app.delete("/api/classes/:id", requireAdmin, async (req, res) => {
   const id = req.params.id;
   if (useMemoryStorage) {
@@ -1546,92 +1552,6 @@ app.post("/api/students", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to add student" });
-  }
-});
-
-app.post("/api/admin/import-students", requireAdmin, async (req, res) => {
-  const rawStudents = Array.isArray(req.body?.students) ? req.body.students : [];
-  const normalizedInput = rawStudents
-    .map((item: unknown) => {
-      const record = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
-      return {
-        name: typeof record.name === "string" ? record.name.trim() : "",
-        className: typeof record.className === "string" ? normalizeClassName(record.className) : "",
-      };
-    })
-    .filter((item: { name: string; className: string }) => item.name && item.className);
-
-  if (normalizedInput.length === 0) {
-    return res.status(400).json({ error: "students are required" });
-  }
-
-  if (useMemoryStorage) {
-    const created: Array<{ id: string; name: string; className: string; email: string; initialPassword: string }> = [];
-    const skipped: Array<{ name: string; className: string; reason: string }> = [];
-
-    for (const item of normalizedInput) {
-      const cls = ensureMemoryClass(item.className);
-      const exists = memoryStudents.some(
-        (student) =>
-          student.classId === cls.id && normalizeStudentName(student.name) === normalizeStudentName(item.name)
-      );
-      if (exists) {
-        skipped.push({ ...item, reason: "Student already exists in this class" });
-        continue;
-      }
-      const createdStudent = createMemoryStudent(cls.id, item.name);
-      created.push({
-        id: createdStudent.id,
-        name: createdStudent.name,
-        className: cls.name,
-        email: createdStudent.email!,
-        initialPassword: createdStudent.initialPassword!,
-      });
-    }
-
-    return res.json({ created, skipped });
-  }
-
-  try {
-    const classesCol = await getClassesCol();
-    const studentsCol = await getStudentsCol();
-    const existingClasses = await classesCol.find({}).toArray();
-    const classMap = new Map(existingClasses.map((cls) => [normalizeClassName(cls.name), { id: cls._id!.toString(), name: cls.name }]));
-    const existingStudents = await studentsCol.find({}).toArray();
-    const existingStudentKeys = new Set(
-      existingStudents.map((student) => `${student.classId.toString()}::${normalizeStudentName(student.name)}`)
-    );
-
-    const created: Array<{ id: string; name: string; className: string; email: string; initialPassword: string }> = [];
-    const skipped: Array<{ name: string; className: string; reason: string }> = [];
-
-    for (const item of normalizedInput) {
-      let cls = classMap.get(item.className);
-      if (!cls) {
-        cls = await ensureMongoClass(item.className);
-        classMap.set(item.className, cls);
-      }
-      const dedupeKey = `${cls.id}::${normalizeStudentName(item.name)}`;
-      if (existingStudentKeys.has(dedupeKey)) {
-        skipped.push({ ...item, reason: "Student already exists in this class" });
-        continue;
-      }
-
-      const createdStudent = await createMongoStudent(cls.id, item.name);
-      existingStudentKeys.add(dedupeKey);
-      created.push({
-        id: createdStudent.id,
-        name: createdStudent.name,
-        className: cls.name,
-        email: createdStudent.email!,
-        initialPassword: createdStudent.initialPassword!,
-      });
-    }
-
-    return res.json({ created, skipped });
-  } catch (e) {
-    console.error("POST /api/admin/import-students error:", e);
-    return res.status(500).json({ error: "Failed to import students" });
   }
 });
 
