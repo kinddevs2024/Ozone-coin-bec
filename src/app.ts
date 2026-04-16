@@ -1288,6 +1288,29 @@ app.get("/api/analytics", async (_req, res) => {
   }
 });
 
+app.get("/api/analytics/overview", async (_req, res) => {
+  if (useMemoryStorage) {
+    return res.json({
+      classesCount: memoryClasses.length,
+      studentsCount: memoryStudents.length,
+      activeCoins: memoryStudents.reduce((sum, student) => sum + student.coins, 0),
+    });
+  }
+
+  try {
+    const [classesCol, studentsCol] = await Promise.all([getClassesCol(), getStudentsCol()]);
+    const [classesCount, studentsList] = await Promise.all([classesCol.countDocuments(), studentsCol.find({}).project({ coins: 1 }).toArray()]);
+    return res.json({
+      classesCount,
+      studentsCount: studentsList.length,
+      activeCoins: studentsList.reduce((sum, student) => sum + student.coins, 0),
+    });
+  } catch (e) {
+    console.error("GET /api/analytics/overview error:", e);
+    return res.status(500).json({ error: "Failed to get analytics overview" });
+  }
+});
+
 app.get("/api/coin-stats", async (req, res) => {
   const rawMode = typeof req.query.mode === "string" ? req.query.mode : "day";
   const mode: "day" | "month" | "custom" =
