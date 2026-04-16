@@ -784,6 +784,93 @@ function starsFromCoins(coins: number, maxCoins: number): number {
   return Math.max(1, Math.min(5, raw));
 }
 
+/** Barcha sinflar o‘quvchilari — bitta umumiy reyting (sahifalangan). */
+app.get("/api/ratings", async (req, res) => {
+  const pageRaw = Number(req.query.page);
+  const sizeRaw = Number(req.query.pageSize);
+  const page = Number.isFinite(pageRaw) && pageRaw >= 0 ? Math.floor(pageRaw) : 0;
+  const pageSize = Number.isFinite(sizeRaw) && sizeRaw >= 1 ? Math.min(50, Math.floor(sizeRaw)) : 10;
+
+  if (useMemoryStorage) {
+    const classNameById = new Map(memoryClasses.map((c) => [c.id, c.name]));
+    const list = memoryStudents
+      .map((s) => ({
+        id: s.id,
+        name: s.name,
+        coins: s.coins,
+        classId: s.classId,
+        className: classNameById.get(s.classId) ?? "—",
+      }))
+      .sort((a, b) => b.coins - a.coins || a.name.localeCompare(b.name) || a.classId.localeCompare(b.classId));
+    const total = list.length;
+    const maxCoins = list[0]?.coins ?? 0;
+    const start = page * pageSize;
+    const slice = list.slice(start, start + pageSize);
+    const items = slice.map((s, i) => ({
+      id: s.id,
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+      rank: start + i + 1,
+      classId: s.classId,
+      className: s.className,
+    }));
+    return res.json({
+      total,
+      page,
+      pageSize,
+      maxCoins,
+      hasMore: start + slice.length < total,
+      items,
+    });
+  }
+
+  try {
+    const [studentsCol, classesCol] = await Promise.all([getStudentsCol(), getClassesCol()]);
+    const [classDocs, studentDocs] = await Promise.all([
+      classesCol.find({}).project({ _id: 1, name: 1 }).toArray(),
+      studentsCol.find({}).project({ name: 1, coins: 1, classId: 1 }).toArray(),
+    ]);
+    const nameByClassId = new Map(classDocs.map((c) => [c._id!.toString(), c.name]));
+    const list = studentDocs
+      .map((s) => {
+        const cid = s.classId.toString();
+        return {
+          id: s._id!.toString(),
+          name: s.name,
+          coins: s.coins,
+          classId: cid,
+          className: nameByClassId.get(cid) ?? "—",
+        };
+      })
+      .sort((a, b) => b.coins - a.coins || a.name.localeCompare(b.name) || a.classId.localeCompare(b.classId));
+    const total = list.length;
+    const maxCoins = list[0]?.coins ?? 0;
+    const start = page * pageSize;
+    const slice = list.slice(start, start + pageSize);
+    const items = slice.map((s, i) => ({
+      id: s.id,
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+      rank: start + i + 1,
+      classId: s.classId,
+      className: s.className,
+    }));
+    return res.json({
+      total,
+      page,
+      pageSize,
+      maxCoins,
+      hasMore: start + slice.length < total,
+      items,
+    });
+  } catch (e) {
+    console.error("GET /api/ratings error:", e);
+    return res.status(500).json({ error: "Failed to load ratings" });
+  }
+});
+
 app.get("/api/classes/:classId/ratings", async (req, res) => {
   const classId = req.params.classId;
   const pageRaw = Number(req.query.page);
