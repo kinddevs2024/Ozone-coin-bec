@@ -47,6 +47,8 @@ const memoryAutoReset: {
   firstCoinAt: string;
   lastResetAt: string | null;
 }[] = [];
+/** UTC kalendariy oy (YYYY-MM) bo'yicha umumiy yulduz TOP-10 mukofoti allaqachon berilgani */
+const memoryStarTop10AwardedMonths = new Set<string>();
 const memoryAssignments: {
   id: string;
   studentId: string;
@@ -65,7 +67,13 @@ const memoryAssignments: {
   reviewComment: string | null;
   awardedCoins: number | null;
 }[] = [];
-type CoinTxType = "admin_update" | "reset" | "assignment_reward" | "weekly_activity_bonus" | "monthly_rank_bonus";
+type CoinTxType =
+  | "admin_update"
+  | "reset"
+  | "assignment_reward"
+  | "weekly_activity_bonus"
+  | "monthly_rank_bonus"
+  | "monthly_star_top10";
 
 const memoryCoinTransactions: {
   id: string;
@@ -94,6 +102,146 @@ const memoryLessonAttendance: {
   present: boolean;
   updatedAt: string;
 }[] = [];
+type CameraStatus = "online" | "degraded" | "offline";
+
+type CameraStreamState = {
+  id: string;
+  name: string;
+  location: string;
+  streamUrl: string;
+  previewUrl: string | null;
+  status: CameraStatus;
+  targetFps: number;
+  inputFps: number;
+  latencyMs: number;
+  updatedAt: string;
+};
+
+type CameraTrackState = {
+  id: string;
+  cameraId: string;
+  globalId: string;
+  confidence: number;
+  reidScore: number;
+  zone: string;
+  seenSince: string;
+  bbox: { x: number; y: number; w: number; h: number };
+  updatedAt: string;
+};
+
+function isoSecondsAgo(seconds: number): string {
+  return new Date(Date.now() - seconds * 1000).toISOString();
+}
+
+const DEFAULT_CAMERA_STREAMS: Omit<CameraStreamState, "updatedAt">[] = [
+  {
+    id: "cam-main-gate",
+    name: "Main Gate",
+    location: "Entrance",
+    streamUrl: "rtsp://10.0.0.11/live/main-gate",
+    previewUrl: null,
+    status: "online",
+    targetFps: 5,
+    inputFps: 20,
+    latencyMs: 120,
+  },
+  {
+    id: "cam-hall-a",
+    name: "Hall A",
+    location: "1st Floor",
+    streamUrl: "rtsp://10.0.0.12/live/hall-a",
+    previewUrl: null,
+    status: "online",
+    targetFps: 5,
+    inputFps: 18,
+    latencyMs: 95,
+  },
+  {
+    id: "cam-cafeteria",
+    name: "Cafeteria",
+    location: "Ground Floor",
+    streamUrl: "rtsp://10.0.0.13/live/cafeteria",
+    previewUrl: null,
+    status: "degraded",
+    targetFps: 5,
+    inputFps: 12,
+    latencyMs: 220,
+  },
+  {
+    id: "cam-library",
+    name: "Library",
+    location: "2nd Floor",
+    streamUrl: "rtsp://10.0.0.14/live/library",
+    previewUrl: null,
+    status: "offline",
+    targetFps: 5,
+    inputFps: 0,
+    latencyMs: 0,
+  },
+];
+
+const DEFAULT_CAMERA_TRACKS: Omit<CameraTrackState, "updatedAt">[] = [
+  {
+    id: "trk-1001",
+    cameraId: "cam-main-gate",
+    globalId: "G-1001",
+    confidence: 0.96,
+    reidScore: 0.93,
+    zone: "Gate lane",
+    seenSince: isoSecondsAgo(260),
+    bbox: { x: 0.12, y: 0.18, w: 0.18, h: 0.36 },
+  },
+  {
+    id: "trk-1002",
+    cameraId: "cam-main-gate",
+    globalId: "G-1012",
+    confidence: 0.92,
+    reidScore: 0.88,
+    zone: "Ticket check",
+    seenSince: isoSecondsAgo(98),
+    bbox: { x: 0.56, y: 0.24, w: 0.14, h: 0.3 },
+  },
+  {
+    id: "trk-2001",
+    cameraId: "cam-hall-a",
+    globalId: "G-0894",
+    confidence: 0.9,
+    reidScore: 0.84,
+    zone: "Corridor left",
+    seenSince: isoSecondsAgo(350),
+    bbox: { x: 0.3, y: 0.28, w: 0.16, h: 0.32 },
+  },
+  {
+    id: "trk-2002",
+    cameraId: "cam-hall-a",
+    globalId: "G-1320",
+    confidence: 0.94,
+    reidScore: 0.9,
+    zone: "Stairs",
+    seenSince: isoSecondsAgo(44),
+    bbox: { x: 0.67, y: 0.2, w: 0.12, h: 0.29 },
+  },
+  {
+    id: "trk-3001",
+    cameraId: "cam-cafeteria",
+    globalId: "G-0777",
+    confidence: 0.81,
+    reidScore: 0.74,
+    zone: "Payment desk",
+    seenSince: isoSecondsAgo(510),
+    bbox: { x: 0.42, y: 0.22, w: 0.18, h: 0.34 },
+  },
+];
+
+const cameraBootIso = new Date().toISOString();
+const memoryCameraStreams: CameraStreamState[] = DEFAULT_CAMERA_STREAMS.map((camera) => ({
+  ...camera,
+  updatedAt: camera.status === "offline" ? isoSecondsAgo(120) : cameraBootIso,
+}));
+const memoryCameraTracks: CameraTrackState[] = DEFAULT_CAMERA_TRACKS.map((track) => ({
+  ...track,
+  updatedAt: cameraBootIso,
+}));
 const ADMIN_USER = process.env.ADMIN_USER || "admin2026";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "112212";
 const JWT_SECRET = process.env.JWT_SECRET || ADMIN_PASSWORD || "ozone-secret";
@@ -238,6 +386,11 @@ function getCoinTransactionsCol() {
     }>("coin_transactions")
   );
 }
+function getStarTop10AwardsCol() {
+  return getDb().then((db) =>
+    db.collection<{ _id: string; awardedAt: string }>("global_star_top10_awards")
+  );
+}
 function getScheduleSlotsCol() {
   return getDb().then((db) =>
     db.collection<{
@@ -261,6 +414,39 @@ function getLessonAttendanceCol() {
       present: boolean;
       updatedAt: string;
     }>("lesson_attendance")
+  );
+}
+function getCameraStreamsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      cameraId: string;
+      name: string;
+      location: string;
+      streamUrl: string;
+      previewUrl: string | null;
+      status: CameraStatus;
+      targetFps: number;
+      inputFps: number;
+      latencyMs: number;
+      updatedAt: string;
+    }>("camera_streams")
+  );
+}
+function getCameraTracksCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      trackId: string;
+      cameraId: string;
+      globalId: string;
+      confidence: number;
+      reidScore: number;
+      zone: string;
+      seenSince: string;
+      bbox: { x: number; y: number; w: number; h: number };
+      updatedAt: string;
+    }>("camera_tracks")
   );
 }
 
@@ -353,6 +539,213 @@ function getMonthKey(iso: string): string {
 function getDayKey(iso: string): string {
   return iso.slice(0, 10);
 }
+type CameraSummaryResponse = {
+  id: string;
+  name: string;
+  location: string;
+  status: CameraStatus;
+  streamUrl: string;
+  previewUrl: string | null;
+  targetFps: number;
+  inputFps: number;
+  processFps: number;
+  latencyMs: number;
+  lastFrameAt: string;
+  peopleCount: number;
+};
+
+type CameraTrackResponse = {
+  trackId: string;
+  cameraId: string;
+  cameraName: string;
+  globalId: string;
+  confidence: number;
+  reidScore: number;
+  zone: string;
+  dwellSeconds: number;
+  lastSeenAt: string;
+  bbox: { x: number; y: number; w: number; h: number };
+};
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeCameraStatus(status: unknown): CameraStatus {
+  if (status === "online" || status === "degraded" || status === "offline") return status;
+  return "offline";
+}
+
+function normalizeBbox(value: unknown): { x: number; y: number; w: number; h: number } {
+  if (!value || typeof value !== "object") return { x: 0.1, y: 0.1, w: 0.2, h: 0.3 };
+  const raw = value as Record<string, unknown>;
+  const x = clamp(Number(raw.x), 0, 0.95);
+  const y = clamp(Number(raw.y), 0, 0.95);
+  const w = clamp(Number(raw.w), 0.05, 1 - x);
+  const h = clamp(Number(raw.h), 0.05, 1 - y);
+  return { x, y, w, h };
+}
+
+function buildDefaultCameraState(nowIso: string): { streams: CameraStreamState[]; tracks: CameraTrackState[] } {
+  return {
+    streams: DEFAULT_CAMERA_STREAMS.map((camera) => ({
+      ...camera,
+      updatedAt: camera.status === "offline" ? isoSecondsAgo(120) : nowIso,
+    })),
+    tracks: DEFAULT_CAMERA_TRACKS.map((track) => ({
+      ...track,
+      updatedAt: nowIso,
+    })),
+  };
+}
+
+function getMemoryCameraState(): { streams: CameraStreamState[]; tracks: CameraTrackState[] } {
+  const nowIso = new Date().toISOString();
+  const streams = memoryCameraStreams.map((camera, index) => {
+    const jitter = index % 2 === 0 ? 8 : -5;
+    const latency = camera.status === "offline" ? 0 : Math.max(60, camera.latencyMs + jitter);
+    return {
+      ...camera,
+      latencyMs: latency,
+      updatedAt: camera.status === "offline" ? camera.updatedAt : nowIso,
+    };
+  });
+  const tracks = memoryCameraTracks.map((track) => ({ ...track, updatedAt: nowIso }));
+  return { streams, tracks };
+}
+
+async function getMongoCameraState(): Promise<{ streams: CameraStreamState[]; tracks: CameraTrackState[] }> {
+  const [streamsCol, tracksCol] = await Promise.all([getCameraStreamsCol(), getCameraTracksCol()]);
+  const [streamDocs, trackDocs] = await Promise.all([streamsCol.find({}).toArray(), tracksCol.find({}).toArray()]);
+
+  const nowIso = new Date().toISOString();
+  const fallback = buildDefaultCameraState(nowIso);
+
+  const streams: CameraStreamState[] =
+    streamDocs.length > 0
+      ? streamDocs.map((doc) => ({
+          id: doc.cameraId,
+          name: doc.name,
+          location: doc.location,
+          streamUrl: doc.streamUrl,
+          previewUrl: doc.previewUrl ?? null,
+          status: normalizeCameraStatus(doc.status),
+          targetFps: Number.isFinite(doc.targetFps) ? Math.max(1, Math.round(doc.targetFps)) : 5,
+          inputFps: Number.isFinite(doc.inputFps) ? Math.max(0, Math.round(doc.inputFps)) : 15,
+          latencyMs: Number.isFinite(doc.latencyMs) ? Math.max(0, Math.round(doc.latencyMs)) : 120,
+          updatedAt: typeof doc.updatedAt === "string" ? doc.updatedAt : nowIso,
+        }))
+      : fallback.streams;
+
+  const streamIds = new Set(streams.map((stream) => stream.id));
+  const mappedTracks = trackDocs
+    .map((doc) => ({
+      id: doc.trackId || doc._id?.toString() || new ObjectId().toString(),
+      cameraId: doc.cameraId,
+      globalId: doc.globalId,
+      confidence: clamp(Number(doc.confidence), 0, 1),
+      reidScore: clamp(Number(doc.reidScore), 0, 1),
+      zone: doc.zone || "Unknown",
+      seenSince: typeof doc.seenSince === "string" ? doc.seenSince : nowIso,
+      bbox: normalizeBbox(doc.bbox),
+      updatedAt: typeof doc.updatedAt === "string" ? doc.updatedAt : nowIso,
+    }))
+    .filter((track) => streamIds.has(track.cameraId));
+
+  const tracks =
+    mappedTracks.length > 0
+      ? mappedTracks
+      : fallback.tracks.filter((track) => streamIds.has(track.cameraId));
+
+  return { streams, tracks };
+}
+
+async function loadCameraState(): Promise<{ streams: CameraStreamState[]; tracks: CameraTrackState[] }> {
+  if (useMemoryStorage) return getMemoryCameraState();
+  try {
+    return await getMongoCameraState();
+  } catch (error) {
+    console.error("Camera data fallback to defaults:", error);
+    return buildDefaultCameraState(new Date().toISOString());
+  }
+}
+
+function buildCameraSnapshot(
+  streams: CameraStreamState[],
+  tracks: CameraTrackState[],
+  cameraFilterId: string | null
+): {
+  updatedAt: string;
+  cameras: CameraSummaryResponse[];
+  tracks: CameraTrackResponse[];
+} {
+  const now = new Date();
+  const nowIso = now.toISOString();
+
+  const streamMap = new Map(streams.map((stream) => [stream.id, stream]));
+  const activeTracksByCamera = new Map<string, CameraTrackState[]>();
+
+  for (const track of tracks) {
+    const camera = streamMap.get(track.cameraId);
+    if (!camera || camera.status === "offline") continue;
+    if (!activeTracksByCamera.has(track.cameraId)) activeTracksByCamera.set(track.cameraId, []);
+    activeTracksByCamera.get(track.cameraId)!.push(track);
+  }
+
+  const cameras: CameraSummaryResponse[] = streams
+    .map((camera) => {
+      const activeTracks = activeTracksByCamera.get(camera.id) ?? [];
+      const processFps =
+        camera.status === "offline"
+          ? 0
+          : Math.min(camera.targetFps, Math.max(1, Math.round(camera.inputFps * 0.75)));
+      return {
+        id: camera.id,
+        name: camera.name,
+        location: camera.location,
+        status: camera.status,
+        streamUrl: camera.streamUrl,
+        previewUrl: camera.previewUrl,
+        targetFps: camera.targetFps,
+        inputFps: camera.status === "offline" ? 0 : camera.inputFps,
+        processFps,
+        latencyMs: camera.status === "offline" ? 0 : camera.latencyMs,
+        lastFrameAt: camera.status === "offline" ? camera.updatedAt : nowIso,
+        peopleCount: activeTracks.length,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const cameraTracks = tracks
+    .filter((track) => {
+      if (cameraFilterId && track.cameraId !== cameraFilterId) return false;
+      const camera = streamMap.get(track.cameraId);
+      return !!camera && camera.status !== "offline";
+    })
+    .map((track) => {
+      const camera = streamMap.get(track.cameraId);
+      const seenSince = new Date(track.seenSince);
+      const dwellSeconds = Number.isNaN(seenSince.getTime())
+        ? 0
+        : Math.max(0, Math.round((now.getTime() - seenSince.getTime()) / 1000));
+      return {
+        trackId: track.id,
+        cameraId: track.cameraId,
+        cameraName: camera?.name ?? track.cameraId,
+        globalId: track.globalId,
+        confidence: Number(track.confidence.toFixed(3)),
+        reidScore: Number(track.reidScore.toFixed(3)),
+        zone: track.zone,
+        dwellSeconds,
+        lastSeenAt: nowIso,
+        bbox: track.bbox,
+      };
+    })
+    .sort((a, b) => a.cameraName.localeCompare(b.cameraName) || b.dwellSeconds - a.dwellSeconds);
+
+  return { updatedAt: nowIso, cameras, tracks: cameraTracks };
+}
 
 /** Dushanba 00:00 UTC — hafta kaliti sifatida YYYY-MM-DD */
 function utcMondayDate(d: Date): Date {
@@ -381,6 +774,7 @@ const WEEKLY_BONUS_EXCLUDED: ReadonlySet<CoinTxType> = new Set([
   "reset",
   "weekly_activity_bonus",
   "monthly_rank_bonus",
+  "monthly_star_top10",
 ]);
 
 function weeklyActivityTargetBonus(qualifyingPositiveSum: number): number {
@@ -523,6 +917,150 @@ async function grantMonthlyRankBonusesMongo(classId: string, ranked: RankRow[], 
       note: `Oy yakuni: sinf bo'yicha ${i + 1}-o'rin — keyingi davr boshlang'ich +${amount} coin`,
       createdAt: resetAt,
     });
+  }
+}
+
+/** Joriy UTC kalendariy oy kaliti: YYYY-MM */
+function utcCalendarMonthKey(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/** Yakunlangan oldingi UTC kalendariy oy (masalan, aprelda — mart) */
+function prevUtcCalendarMonthKey(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth();
+  if (m === 0) return `${y - 1}-12`;
+  return `${y}-${String(m).padStart(2, "0")}`;
+}
+
+type StarBoardRow = { id: string; classId: string; name: string; coins: number; stars: number };
+
+function buildGlobalStarLeaderboardMemory(): StarBoardRow[] {
+  if (memoryStudents.length === 0) return [];
+  const maxCoins = Math.max(0, ...memoryStudents.map((s) => s.coins));
+  return memoryStudents
+    .map((s) => ({
+      id: s.id,
+      classId: s.classId,
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+    }))
+    .sort(
+      (a, b) =>
+        b.stars - a.stars ||
+        b.coins - a.coins ||
+        a.name.localeCompare(b.name) ||
+        a.classId.localeCompare(b.classId)
+    );
+}
+
+async function buildGlobalStarLeaderboardMongo(): Promise<StarBoardRow[]> {
+  const studentsCol = await getStudentsCol();
+  const studentDocs = await studentsCol.find({}).project({ name: 1, coins: 1, classId: 1 }).toArray();
+  if (studentDocs.length === 0) return [];
+  const maxCoins = Math.max(0, ...studentDocs.map((s) => s.coins));
+  return studentDocs
+    .map((s) => ({
+      id: s._id!.toString(),
+      classId: s.classId.toString(),
+      name: s.name,
+      coins: s.coins,
+      stars: starsFromCoins(s.coins, maxCoins),
+    }))
+    .sort(
+      (a, b) =>
+        b.stars - a.stars ||
+        b.coins - a.coins ||
+        a.name.localeCompare(b.name) ||
+        a.classId.localeCompare(b.classId)
+    );
+}
+
+/** TOP-10 ichidagi o'rin: 1 (eng yaxshi) → 10 coin … 10 → 100 coin (o'rin × 10). */
+function starTop10BonusForRank(rank: number): number {
+  if (rank < 1 || rank > 10) return 0;
+  return rank * 10;
+}
+
+function grantStarTop10BonusesMemory(resultsMonth: string, awardedAt: string) {
+  const board = buildGlobalStarLeaderboardMemory();
+  for (let i = 0; i < 10 && i < board.length; i++) {
+    const row = board[i]!;
+    const rank = i + 1;
+    const amount = starTop10BonusForRank(rank);
+    if (amount <= 0) continue;
+    const s = memoryStudents.find((x) => x.id === row.id);
+    if (!s) continue;
+    s.coins += amount;
+    memoryCoinTransactions.push({
+      id: new ObjectId().toString(),
+      studentId: row.id,
+      classId: row.classId,
+      amount,
+      type: "monthly_star_top10",
+      note: `Umumiy yulduz reytingi TOP-10 (${resultsMonth} yakuni): ${rank}-o'rin — keyingi oy boshida +${amount} coin`,
+      createdAt: awardedAt,
+    });
+    applyWeeklyActivityBonusMemory(row.id, row.classId);
+  }
+}
+
+async function grantStarTop10BonusesMongo(resultsMonth: string, awardedAt: string) {
+  const board = await buildGlobalStarLeaderboardMongo();
+  const studentsCol = await getStudentsCol();
+  const txCol = await getCoinTransactionsCol();
+  for (let i = 0; i < 10 && i < board.length; i++) {
+    const row = board[i]!;
+    const rank = i + 1;
+    const amount = starTop10BonusForRank(rank);
+    if (amount <= 0) continue;
+    await studentsCol.updateOne({ _id: new ObjectId(row.id) }, { $inc: { coins: amount } });
+    await txCol.insertOne({
+      studentId: row.id,
+      classId: row.classId,
+      amount,
+      type: "monthly_star_top10",
+      note: `Umumiy yulduz reytingi TOP-10 (${resultsMonth} yakuni): ${rank}-o'rin — keyingi oy boshida +${amount} coin`,
+      createdAt: awardedAt,
+    });
+    await applyWeeklyActivityBonusMongo(row.id, row.classId);
+  }
+}
+
+/** Har oy (UTC) yakunida: oldingi oy uchun umumiy yulduz TOP-10 ga bir marta coin. */
+async function checkMonthlyStarTop10Bonuses() {
+  const now = new Date();
+  const resultsMonth = prevUtcCalendarMonthKey(now);
+  const awardedAt = now.toISOString();
+
+  if (useMemoryStorage) {
+    if (memoryStarTop10AwardedMonths.has(resultsMonth)) return;
+    grantStarTop10BonusesMemory(resultsMonth, awardedAt);
+    memoryStarTop10AwardedMonths.add(resultsMonth);
+    console.log(`[Star TOP-10] Memory: results month ${resultsMonth}`);
+    return;
+  }
+
+  const awardsCol = await getStarTop10AwardsCol();
+  try {
+    await awardsCol.insertOne({ _id: resultsMonth, awardedAt });
+  } catch (e: unknown) {
+    const code = typeof e === "object" && e !== null && "code" in e ? (e as { code?: number }).code : undefined;
+    if (code === 11000) return;
+    console.error("[Star TOP-10] Lock insert failed:", e);
+    return;
+  }
+  try {
+    await grantStarTop10BonusesMongo(resultsMonth, awardedAt);
+    console.log(`[Star TOP-10] MongoDB: results month ${resultsMonth}`);
+  } catch (e) {
+    console.error("[Star TOP-10] Grant failed, removing lock for retry:", e);
+    try {
+      await awardsCol.deleteOne({ _id: resultsMonth });
+    } catch (delErr) {
+      console.error("[Star TOP-10] Lock delete failed:", delErr);
+    }
   }
 }
 
@@ -815,12 +1353,14 @@ app.get("/api/ratings", async (req, res) => {
       classId: s.classId,
       className: s.className,
     }));
+    const calendarMonthKey = utcCalendarMonthKey(new Date());
     return res.json({
       total,
       page,
       pageSize,
       maxCoins,
       hasMore: start + slice.length < total,
+      calendarMonthKey,
       items,
     });
   }
@@ -857,12 +1397,14 @@ app.get("/api/ratings", async (req, res) => {
       classId: s.classId,
       className: s.className,
     }));
+    const calendarMonthKey = utcCalendarMonthKey(new Date());
     return res.json({
       total,
       page,
       pageSize,
       maxCoins,
       hasMore: start + slice.length < total,
+      calendarMonthKey,
       items,
     });
   } catch (e) {
@@ -1800,6 +2342,40 @@ app.get("/api/coin-stats", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/admin/cameras", requireAdmin, async (_req, res) => {
+  try {
+    const { streams, tracks } = await loadCameraState();
+    const snapshot = buildCameraSnapshot(streams, tracks, null);
+    return res.json({
+      updatedAt: snapshot.updatedAt,
+      cameras: snapshot.cameras,
+    });
+  } catch (e) {
+    console.error("GET /api/admin/cameras error:", e);
+    return res.status(500).json({ error: "Failed to load cameras" });
+  }
+});
+
+app.get("/api/admin/camera-tracks", requireAdmin, async (req, res) => {
+  const cameraIdRaw = typeof req.query.cameraId === "string" ? req.query.cameraId.trim() : "";
+  const cameraId = cameraIdRaw && cameraIdRaw !== "all" ? cameraIdRaw : null;
+  try {
+    const { streams, tracks } = await loadCameraState();
+    const snapshot = buildCameraSnapshot(streams, tracks, cameraId);
+    if (cameraId && !snapshot.cameras.some((camera) => camera.id === cameraId)) {
+      return res.status(404).json({ error: "Camera not found" });
+    }
+    return res.json({
+      updatedAt: snapshot.updatedAt,
+      cameraId: cameraId ?? "all",
+      tracks: snapshot.tracks,
+    });
+  } catch (e) {
+    console.error("GET /api/admin/camera-tracks error:", e);
+    return res.status(500).json({ error: "Failed to load tracks" });
+  }
+});
+
 app.get("/api/admin/schedule-slots", requireAdmin, async (req, res) => {
   const classId = typeof req.query.classId === "string" ? req.query.classId.trim() : "";
   if (!classId) return res.status(400).json({ error: "classId required" });
@@ -2624,7 +3200,11 @@ async function checkAutoResets() {
   }
 }
 
-checkAutoResets();
-setInterval(checkAutoResets, 60 * 60 * 1000);
+void checkMonthlyStarTop10Bonuses();
+void checkAutoResets();
+setInterval(() => {
+  void checkMonthlyStarTop10Bonuses();
+  void checkAutoResets();
+}, 60 * 60 * 1000);
 
 export default app;
