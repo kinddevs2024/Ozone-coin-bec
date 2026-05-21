@@ -33,6 +33,14 @@ const memoryCommunityPosts: {
   createdAt: string;
   author: "admin";
 }[] = [];
+const memoryStudentProjects: {
+  id: string;
+  name: string;
+  link: string;
+  imageDataUrl: string;
+  createdAt: string;
+  author: "admin";
+}[] = [];
 const memoryAnalytics: {
   id: string;
   classId: string;
@@ -327,6 +335,18 @@ function getCommunityPostsCol() {
       createdAt: string;
       author: "admin";
     }>("community_posts")
+  );
+}
+function getStudentProjectsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      name: string;
+      link: string;
+      imageDataUrl: string;
+      createdAt: string;
+      author: "admin";
+    }>("student_projects")
   );
 }
 function getAnalyticsCol() {
@@ -1091,6 +1111,18 @@ function coerceNonNegativeInt(value: unknown): number {
   if (!Number.isFinite(num) || num < 0) return 0;
   return Math.floor(num);
 }
+function normalizeProjectLink(value: unknown): string | null {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return null;
+  const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
 function createDateRange(fromIso: string, toIso: string, mode: "day" | "month"): string[] {
   const out: string[] = [];
   const start = new Date(fromIso);
@@ -1571,6 +1603,29 @@ app.get("/api/community-posts", async (_req, res) => {
     );
   } catch (e) {
     console.error("GET /api/community-posts error:", e);
+    return res.status(200).json([]);
+  }
+});
+
+app.get("/api/student-projects", async (_req, res) => {
+  if (useMemoryStorage) {
+    return res.json([...memoryStudentProjects].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }
+  try {
+    const col = await getStudentProjectsCol();
+    const list = await col.find({}).sort({ createdAt: -1 }).toArray();
+    return res.json(
+      list.map((project) => ({
+        id: project._id?.toString(),
+        name: project.name || "",
+        link: project.link || "",
+        imageDataUrl: project.imageDataUrl || "",
+        createdAt: project.createdAt,
+        author: "admin" as const,
+      }))
+    );
+  } catch (e) {
+    console.error("GET /api/student-projects error:", e);
     return res.status(200).json([]);
   }
 });
@@ -2144,6 +2199,112 @@ app.post("/api/community-posts", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error("POST /api/community-posts error:", e);
     return res.status(500).json({ error: "Failed to create community post" });
+  }
+});
+
+app.post("/api/student-projects", requireAdmin, async (req, res) => {
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  const link = normalizeProjectLink(req.body?.link);
+  const imageDataUrl =
+    typeof req.body?.imageDataUrl === "string" && req.body.imageDataUrl.startsWith("data:image/")
+      ? req.body.imageDataUrl
+      : "";
+
+  if (!name) return res.status(400).json({ error: "Project name is required" });
+  if (!link) return res.status(400).json({ error: "Valid project link is required" });
+  if (!imageDataUrl) return res.status(400).json({ error: "Project image is required" });
+  if (imageDataUrl.length > 8_000_000) return res.status(400).json({ error: "Image is too large" });
+
+  const entry = {
+    name,
+    link,
+    imageDataUrl,
+    createdAt: new Date().toISOString(),
+    author: "admin" as const,
+  };
+
+  if (useMemoryStorage) {
+    const project = { id: new ObjectId().toString(), ...entry };
+    memoryStudentProjects.unshift(project);
+    return res.json(project);
+  }
+
+  try {
+    const col = await getStudentProjectsCol();
+    const result = await col.insertOne(entry);
+    return res.json({ id: result.insertedId.toString(), ...entry });
+  } catch (e) {
+    console.error("POST /api/student-projects error:", e);
+    return res.status(500).json({ error: "Failed to create student project" });
+  }
+});
+
+app.put("/api/student-projects/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+  const link = normalizeProjectLink(req.body?.link);
+  const imageDataUrl =
+    typeof req.body?.imageDataUrl === "string" && req.body.imageDataUrl.startsWith("data:image/")
+      ? req.body.imageDataUrl
+      : "";
+  const keepImage = req.body?.keepImage === true;
+
+  if (!name) return res.status(400).json({ error: "Project name is required" });
+  if (!link) return res.status(400).json({ error: "Valid project link is required" });
+  if (!imageDataUrl && !keepImage) return res.status(400).json({ error: "Project image is required" });
+  if (imageDataUrl.length > 8_000_000) return res.status(400).json({ error: "Image is too large" });
+
+  if (useMemoryStorage) {
+    const project = memoryStudentProjects.find((p) => p.id === id);
+    if (!project) return res.status(404).json({ error: "Not found" });
+    project.name = name;
+    project.link = link;
+    if (imageDataUrl) project.imageDataUrl = imageDataUrl;
+    return res.json(project);
+  }
+
+  try {
+    const oid = new ObjectId(id);
+    const col = await getStudentProjectsCol();
+    const update: Record<string, unknown> = { name, link };
+    if (imageDataUrl) update.imageDataUrl = imageDataUrl;
+    const updated = await col.findOneAndUpdate(
+      { _id: oid },
+      { $set: update },
+      { returnDocument: "after" }
+    );
+    if (!updated) return res.status(404).json({ error: "Not found" });
+    return res.json({
+      id: updated._id?.toString(),
+      name: updated.name || "",
+      link: updated.link || "",
+      imageDataUrl: updated.imageDataUrl || "",
+      createdAt: updated.createdAt,
+      author: "admin" as const,
+    });
+  } catch (e) {
+    console.error("PUT /api/student-projects/:id error:", e);
+    return res.status(500).json({ error: "Failed to update student project" });
+  }
+});
+
+app.delete("/api/student-projects/:id", requireAdmin, async (req, res) => {
+  const id = req.params.id;
+  if (useMemoryStorage) {
+    const idx = memoryStudentProjects.findIndex((p) => p.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Not found" });
+    memoryStudentProjects.splice(idx, 1);
+    return res.json({ success: true });
+  }
+  try {
+    const oid = new ObjectId(id);
+    const col = await getStudentProjectsCol();
+    const r = await col.deleteOne({ _id: oid });
+    if (r.deletedCount === 0) return res.status(404).json({ error: "Not found" });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("DELETE /api/student-projects/:id error:", e);
+    return res.status(500).json({ error: "Failed to delete student project" });
   }
 });
 
