@@ -75,6 +75,7 @@ const memoryAssignments: {
   reviewComment: string | null;
   awardedCoins: number | null;
 }[] = [];
+const memoryTestSubmissions: TestSubmissionState[] = [];
 type CoinTxType =
   | "admin_update"
   | "reset"
@@ -111,6 +112,20 @@ const memoryLessonAttendance: {
   updatedAt: string;
 }[] = [];
 type CameraStatus = "online" | "degraded" | "offline";
+
+type TestVariantId = "A" | "B";
+
+type TestSubmissionState = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  variant: TestVariantId;
+  answers: Record<string, string>;
+  correctCount: number;
+  totalQuestions: number;
+  percent: number;
+  createdAt: string;
+};
 
 type CameraStreamState = {
   id: string;
@@ -264,6 +279,65 @@ const ALLOWED_ORIGINS = new Set(
   ].filter(Boolean)
 );
 
+const TEST_ANSWER_KEYS: Record<TestVariantId, Record<string, string>> = {
+  A: {
+    "1": "b",
+    "2": "c",
+    "3": "a",
+    "4": "b",
+    "5": "b",
+    "6": "a",
+    "7": "d",
+    "8": "a",
+    "9": "b",
+    "10": "a",
+    "11": "a",
+    "12": "a",
+    "13": "b",
+    "14": "a",
+    "15": "b",
+  },
+  B: {
+    "1": "a",
+    "2": "b",
+    "3": "b",
+    "4": "c",
+    "5": "a",
+    "6": "b",
+    "7": "b",
+    "8": "a",
+    "9": "a",
+    "10": "a",
+    "11": "a",
+    "12": "a",
+    "13": "a",
+    "14": "a",
+    "15": "c",
+  },
+};
+
+function normalizeTestVariant(value: unknown): TestVariantId | null {
+  const v = String(value ?? "").trim().toUpperCase();
+  return v === "A" || v === "B" ? v : null;
+}
+
+function scoreTestAnswers(variant: TestVariantId, rawAnswers: unknown) {
+  const key = TEST_ANSWER_KEYS[variant];
+  const source = rawAnswers && typeof rawAnswers === "object" ? (rawAnswers as Record<string, unknown>) : {};
+  const answers: Record<string, string> = {};
+  let correctCount = 0;
+
+  for (const questionId of Object.keys(key)) {
+    const answer = String(source[questionId] ?? "").trim().toLowerCase();
+    answers[questionId] = ["a", "b", "c", "d"].includes(answer) ? answer : "";
+    if (answers[questionId] === key[questionId]) correctCount += 1;
+  }
+
+  const totalQuestions = Object.keys(key).length;
+  const percent = Math.round((correctCount / totalQuestions) * 100);
+  return { answers, correctCount, totalQuestions, percent };
+}
+
 function isPrivateIpv4(hostname: string): boolean {
   if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
   if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
@@ -391,6 +465,21 @@ function getAssignmentsCol() {
       reviewComment: string | null;
       awardedCoins?: number | null;
     }>("assignments")
+  );
+}
+function getTestSubmissionsCol() {
+  return getDb().then((db) =>
+    db.collection<{
+      _id?: ObjectId;
+      firstName: string;
+      lastName: string;
+      variant: TestVariantId;
+      answers: Record<string, string>;
+      correctCount: number;
+      totalQuestions: number;
+      percent: number;
+      createdAt: string;
+    }>("test_submissions")
   );
 }
 function getCoinTransactionsCol() {
@@ -1898,6 +1987,57 @@ app.get("/api/student/coin-history", requireStudent, async (req, res) => {
 
 app.post("/api/admin/logout", (_req, res) => {
   res.json({ ok: true });
+});
+
+app.post("/api/public-tests/submissions", async (req, res) => {
+  const firstName = String(req.body?.firstName ?? "").trim();
+  const lastName = String(req.body?.lastName ?? "").trim();
+  const variant = normalizeTestVariant(req.body?.variant);
+  if (!firstName || !lastName) return res.status(400).json({ error: "firstName and lastName required" });
+  if (!variant) return res.status(400).json({ error: "variant must be A or B" });
+
+  const result = scoreTestAnswers(variant, req.body?.answers);
+  const createdAt = new Date().toISOString();
+  const submission = {
+    firstName,
+    lastName,
+    variant,
+    answers: result.answers,
+    correctCount: result.correctCount,
+    totalQuestions: result.totalQuestions,
+    percent: result.percent,
+    createdAt,
+  };
+
+  if (useMemoryStorage) {
+    const saved = { id: new ObjectId().toString(), ...submission };
+    memoryTestSubmissions.push(saved);
+    return res.json(saved);
+  }
+
+  try {
+    const col = await getTestSubmissionsCol();
+    const inserted = await col.insertOne(submission);
+    return res.json({ id: inserted.insertedId.toString(), ...submission });
+  } catch (e) {
+    console.error("POST /api/public-tests/submissions error:", e);
+    return res.status(500).json({ error: "Failed to submit test" });
+  }
+});
+
+app.get("/api/admin/public-tests/submissions", requireAdmin, async (_req, res) => {
+  if (useMemoryStorage) {
+    return res.json(memoryTestSubmissions.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }
+
+  try {
+    const col = await getTestSubmissionsCol();
+    const list = await col.find({}).sort({ createdAt: -1 }).toArray();
+    return res.json(list.map((item) => ({ id: item._id?.toString(), ...item })));
+  } catch (e) {
+    console.error("GET /api/admin/public-tests/submissions error:", e);
+    return res.status(500).json({ error: "Failed to get test submissions" });
+  }
 });
 
 app.post("/api/assignments", requireAdmin, async (req, res) => {
